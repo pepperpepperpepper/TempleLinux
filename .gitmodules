@@ -1,0 +1,3 @@
+[submodule "third_party/TempleOS"]
+	path = third_party/TempleOS
+	url = https://github.com/cia-foundation/TempleOS.git

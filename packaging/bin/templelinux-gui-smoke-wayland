@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "${TEMPLEOS_ROOT:-}" ]]; then
+  if [[ -f "/usr/share/templelinux/TempleOS/Kernel/FontStd.HC" ]]; then
+    export TEMPLEOS_ROOT="/usr/share/templelinux/TempleOS"
+  else
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    repo_root="$(cd "${script_dir}/../.." && pwd)"
+    candidate="${repo_root}/third_party/TempleOS"
+    if [[ -f "${candidate}/Kernel/FontStd.HC" ]]; then
+      export TEMPLEOS_ROOT="${candidate}"
+    fi
+  fi
+fi
+
+if ! command -v weston >/dev/null 2>&1; then
+  echo "templelinux-gui-smoke-wayland: weston not found in PATH" >&2
+  exit 127
+fi
+
+if ! command -v templeshell >/dev/null 2>&1; then
+  echo "templelinux-gui-smoke-wayland: templeshell not found in PATH (try: cargo install --path .)" >&2
+  exit 127
+fi
+
+if ! command -v temple-hc >/dev/null 2>&1; then
+  echo "templelinux-gui-smoke-wayland: temple-hc not found in PATH (try: cargo install --path .)" >&2
+  exit 127
+fi
+
+demo="${TEMPLE_GUI_SMOKE_DEMO:-::/Demo/Graphics/NetOfDots.HC}"
+out="${1:-${TEMPLE_GUI_SMOKE_OUT:-gui-smoke-wayland.png}}"
+
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp}"
+uniq="$(date +%s%N)-$$"
+wayland_sock="wayland-gui-smoke-${uniq}"
+weston_log="${runtime_dir}/weston-gui-smoke-${uniq}.log"
+temple_sock="${runtime_dir}/templeshell-gui-smoke-${uniq}.sock"
+
+# Force Mesa software GL, similar to the X11 script.
+export __EGL_VENDOR_LIBRARY_FILENAMES="${__EGL_VENDOR_LIBRARY_FILENAMES:-/usr/share/glvnd/egl_vendor.d/50_mesa.json}"
+export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
+export WGPU_BACKEND="${WGPU_BACKEND:-gl}"
+
+weston --backend=headless-backend.so --socket="${wayland_sock}" --idle-time=0 --log="${weston_log}" &
+weston_pid=$!
+
+cleanup() {
+  kill "${weston_pid}" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+for _ in {1..200}; do
+  if [[ -S "${runtime_dir}/${wayland_sock}" ]]; then
+    break
+  fi
+  if ! kill -0 "${weston_pid}" 2>/dev/null; then
+    echo "templelinux-gui-smoke-wayland: weston exited early; see ${weston_log}" >&2
+    exit 1
+  fi
+  sleep 0.05
+done
+
+if [[ ! -S "${runtime_dir}/${wayland_sock}" ]]; then
+  echo "templelinux-gui-smoke-wayland: timed out waiting for ${runtime_dir}/${wayland_sock}" >&2
+  exit 1
+fi
+
+export WAYLAND_DISPLAY="${wayland_sock}"
+export TEMPLE_SOCK="${temple_sock}"
+
+templeshell --no-fullscreen --test-dump-app-png "${out}" &
+shell_pid=$!
+
+for _ in {1..200}; do
+  if [[ -S "${temple_sock}" ]]; then
+    break
+  fi
+  if ! kill -0 "${shell_pid}" 2>/dev/null; then
+    echo "templelinux-gui-smoke-wayland: templeshell exited before creating ${temple_sock}" >&2
+    wait "${shell_pid}" || true
+    exit 1
+  fi
+  sleep 0.05
+done
+
+if [[ ! -S "${temple_sock}" ]]; then
+  echo "templelinux-gui-smoke-wayland: timed out waiting for ${temple_sock}" >&2
+  kill "${shell_pid}" 2>/dev/null || true
+  wait "${shell_pid}" || true
+  exit 1
+fi
+
+temple-hc "${demo}"
+
+wait "${shell_pid}" || true
+
+if [[ ! -f "${out}" ]]; then
+  echo "templelinux-gui-smoke-wayland: expected PNG at ${out}" >&2
+  exit 1
+fi
+
+echo "templelinux-gui-smoke-wayland: wrote ${out}"

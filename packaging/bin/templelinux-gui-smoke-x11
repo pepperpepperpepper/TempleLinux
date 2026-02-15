@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "${TEMPLEOS_ROOT:-}" ]]; then
+  if [[ -f "/usr/share/templelinux/TempleOS/Kernel/FontStd.HC" ]]; then
+    export TEMPLEOS_ROOT="/usr/share/templelinux/TempleOS"
+  else
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    repo_root="$(cd "${script_dir}/../.." && pwd)"
+    candidate="${repo_root}/third_party/TempleOS"
+    if [[ -f "${candidate}/Kernel/FontStd.HC" ]]; then
+      export TEMPLEOS_ROOT="${candidate}"
+    fi
+  fi
+fi
+
+if ! command -v xvfb-run >/dev/null 2>&1; then
+  echo "templelinux-gui-smoke-x11: xvfb-run not found in PATH" >&2
+  exit 127
+fi
+
+if ! command -v templeshell >/dev/null 2>&1; then
+  echo "templelinux-gui-smoke-x11: templeshell not found in PATH (try: cargo install --path .)" >&2
+  exit 127
+fi
+
+if ! command -v temple-hc >/dev/null 2>&1; then
+  echo "templelinux-gui-smoke-x11: temple-hc not found in PATH (try: cargo install --path .)" >&2
+  exit 127
+fi
+
+demo="${TEMPLE_GUI_SMOKE_DEMO:-::/Demo/Graphics/NetOfDots.HC}"
+out="${1:-${TEMPLE_GUI_SMOKE_OUT:-gui-smoke-x11.png}}"
+
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp}"
+uniq="$(date +%s%N)-$$"
+sock="${runtime_dir}/templeshell-gui-smoke-${uniq}.sock"
+
+# Xvfb can crash if GLVND selects NVIDIA's EGL vendor libraries. Force Mesa so we
+# can reliably run headless tests on machines without a real GPU attached.
+export __EGL_VENDOR_LIBRARY_FILENAMES="${__EGL_VENDOR_LIBRARY_FILENAMES:-/usr/share/glvnd/egl_vendor.d/50_mesa.json}"
+export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-mesa}"
+export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
+export WGPU_BACKEND="${WGPU_BACKEND:-gl}"
+export WINIT_UNIX_BACKEND="${WINIT_UNIX_BACKEND:-x11}"
+
+export TEMPLE_SOCK="${sock}"
+
+xvfb-run -a -s "-screen 0 1280x720x24 -nolisten tcp" \
+  templeshell --no-fullscreen --test-dump-app-png "${out}" &
+shell_pid=$!
+
+for _ in {1..200}; do
+  if [[ -S "${sock}" ]]; then
+    break
+  fi
+  if ! kill -0 "${shell_pid}" 2>/dev/null; then
+    echo "templelinux-gui-smoke-x11: templeshell exited before creating ${sock}" >&2
+    wait "${shell_pid}" || true
+    exit 1
+  fi
+  sleep 0.05
+done
+
+if [[ ! -S "${sock}" ]]; then
+  echo "templelinux-gui-smoke-x11: timed out waiting for ${sock}" >&2
+  kill "${shell_pid}" 2>/dev/null || true
+  wait "${shell_pid}" || true
+  exit 1
+fi
+
+temple-hc "${demo}"
+
+wait "${shell_pid}" || true
+
+if [[ ! -f "${out}" ]]; then
+  echo "templelinux-gui-smoke-x11: expected PNG at ${out}" >&2
+  exit 1
+fi
+
+echo "templelinux-gui-smoke-x11: wrote ${out}"

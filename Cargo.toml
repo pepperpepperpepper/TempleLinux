@@ -1,0 +1,37 @@
+[package]
+name = "templeshell"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "temple_rt"
+
+[[bin]]
+name = "temple-demo"
+path = "src/bin/temple_demo.rs"
+
+[[bin]]
+name = "temple-hc"
+path = "src/bin/temple_hc.rs"
+
+[[bin]]
+name = "temple-paint"
+path = "src/bin/temple_paint.rs"
+
+[[bin]]
+name = "temple-edit"
+path = "src/bin/temple_edit.rs"
+
+[dependencies]
+arboard = "3.6.1"
+bytemuck = { version = "1.14", features = ["derive"] }
+memmap2 = "0.9"
+nix = { version = "0.29", features = ["fs", "socket", "uio"] }
+pollster = "0.3"
+png = "0.17"
+cpal = "0.15"
+wgpu = "0.20"
+winit = "0.29"
+
+[dev-dependencies]
+sha2 = "0.10"

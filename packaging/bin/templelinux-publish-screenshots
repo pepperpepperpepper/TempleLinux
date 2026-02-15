@@ -1,0 +1,659 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "${root}"
+
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "${cmd}" >/dev/null 2>&1; then
+    echo "templelinux-publish-screenshots: '${cmd}' not found in PATH" >&2
+    exit 127
+  fi
+}
+
+require_cmd cargo
+require_cmd xvfb-run
+require_cmd wtf-upload
+
+prefix="${TEMPLE_UPLOAD_PREFIX:-templelinux/screenshots/$(date -u +%Y/%m/%d)/$(date -u +%H%M%S)-$$}"
+prefix="${prefix%/}"
+
+out_dir="${TEMPLE_SCREENSHOT_DIR:-}"
+if [[ -z "${out_dir}" ]]; then
+  out_dir="$(mktemp -d -t templelinux-screenshots-XXXXXXXX)"
+fi
+
+echo "templelinux-publish-screenshots: output dir: ${out_dir}"
+echo "templelinux-publish-screenshots: upload key prefix: ${prefix}/"
+
+mkdir -p "${out_dir}"
+
+echo "templelinux-publish-screenshots: building binaries…"
+cargo build -q --bin templeshell --bin temple-hc --bin temple-edit --bin temple-demo --bin temple-paint
+
+templeshell_bin="${root}/target/debug/templeshell"
+temple_hc_bin="${root}/target/debug/temple-hc"
+temple_edit_bin="${root}/target/debug/temple-edit"
+
+if [[ ! -x "${templeshell_bin}" ]]; then
+  echo "templelinux-publish-screenshots: missing executable: ${templeshell_bin}" >&2
+  exit 1
+fi
+if [[ ! -x "${temple_hc_bin}" ]]; then
+  echo "templelinux-publish-screenshots: missing executable: ${temple_hc_bin}" >&2
+  exit 1
+fi
+if [[ ! -x "${temple_edit_bin}" ]]; then
+  echo "templelinux-publish-screenshots: missing executable: ${temple_edit_bin}" >&2
+  exit 1
+fi
+
+# Xvfb can crash if GLVND selects NVIDIA's EGL vendor libraries. Force Mesa so we
+# can reliably run headless tests on machines without a real GPU attached.
+export __EGL_VENDOR_LIBRARY_FILENAMES="${__EGL_VENDOR_LIBRARY_FILENAMES:-/usr/share/glvnd/egl_vendor.d/50_mesa.json}"
+export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-mesa}"
+export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
+export WGPU_BACKEND="${WGPU_BACKEND:-gl}"
+export WINIT_UNIX_BACKEND="${WINIT_UNIX_BACKEND:-x11}"
+export TEMPLE_SYNC_PRESENT="${TEMPLE_SYNC_PRESENT:-1}"
+export TEMPLE_SYNC_PRESENT_TIMEOUT_MS="${TEMPLE_SYNC_PRESENT_TIMEOUT_MS:-2000}"
+
+xvfb_args="${TEMPLE_XVFB_ARGS:--screen 0 1280x720x24 -nolisten tcp}"
+
+initial_png="${out_dir}/templeshell-initial.png"
+files_png="${out_dir}/filebrowser.png"
+apps_png="${out_dir}/applauncher.png"
+personalmenu_png="${out_dir}/personalmenu.png"
+doldoc_png="${out_dir}/doldoc-demoindex.png"
+doldoc_overview_png="${out_dir}/doldoc-overview.png"
+doldoc_job_png="${out_dir}/doldoc-job.png"
+doldoc_helpindex_png="${out_dir}/doldoc-helpindex.png"
+linuxbridge_png="${out_dir}/linuxbridge.png"
+timeclock_png="${out_dir}/timeclock.png"
+logic_png="${out_dir}/logic.png"
+keepaway_png="${out_dir}/keepaway.png"
+multi_png="${out_dir}/multiwindow.png"
+triple_png="${out_dir}/triplewindow.png"
+spriteplot_png="${out_dir}/spriteplot.png"
+lines_png="${out_dir}/lines.png"
+pulldown_png="${out_dir}/pulldownmenu.png"
+tictactoe_png="${out_dir}/tictactoe.png"
+chardemo_png="${out_dir}/chardemo.png"
+slider_png="${out_dir}/slider.png"
+wallpaperctrl_png="${out_dir}/wallpaperctrl.png"
+wallpaperfish_png="${out_dir}/wallpaperfish.png"
+scrollbars_png="${out_dir}/scrollbars.png"
+grid_png="${out_dir}/grid.png"
+palette_png="${out_dir}/palette.png"
+echo "templelinux-publish-screenshots: capturing initial shell frame → ${initial_png}"
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen --test-dump-initial-png "${initial_png}"
+
+echo "templelinux-publish-screenshots: capturing file browser frame → ${files_png}"
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "mkdir /Home/Demo" \
+  --test-run-shell "touch /Home/Demo/hello.txt" \
+  --test-run-shell "touch /Home/Demo/Notes.txt" \
+  --test-run-shell "files /Home/Demo" \
+  --test-dump-initial-png "${files_png}"
+
+echo "templelinux-publish-screenshots: capturing app launcher frame → ${apps_png}"
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "apps" \
+  --test-dump-initial-png "${apps_png}"
+
+echo "templelinux-publish-screenshots: capturing TempleOS PersonalMenu icon frame → ${personalmenu_png}"
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "menu" \
+  --test-dump-initial-png "${personalmenu_png}"
+
+echo "templelinux-publish-screenshots: capturing DolDoc frame (DemoIndex.DD) → ${doldoc_png}"
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "help DemoIndex" \
+  --test-dump-initial-png "${doldoc_png}"
+
+echo "templelinux-publish-screenshots: capturing DolDoc frame (DolDocOverview.DD, escaped '$' + literal cmds) → ${doldoc_overview_png}"
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "help DolDocOverview" \
+  --test-dump-initial-png "${doldoc_overview_png}"
+
+echo "templelinux-publish-screenshots: capturing DolDoc frame (Job.DD) → ${doldoc_job_png}"
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "help Job" \
+  --test-dump-initial-png "${doldoc_job_png}"
+
+echo "templelinux-publish-screenshots: capturing DolDoc frame (HelpIndex.DD, sprites) → ${doldoc_helpindex_png}"
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "help HelpIndex" \
+  --test-dump-initial-png "${doldoc_helpindex_png}"
+
+echo "templelinux-publish-screenshots: capturing LinuxBridge frame → ${linuxbridge_png}"
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "tapp linuxbridge" \
+  --test-dump-app-png "${linuxbridge_png}" \
+  --test-app-exit esc
+
+echo "templelinux-publish-screenshots: capturing TimeClock frame → ${timeclock_png}"
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "mkdir /Home/TimeClock" \
+  --test-run-shell "tapp timeclock" \
+  --test-dump-app-png "${timeclock_png}" \
+  --test-app-exit esc
+
+echo "templelinux-publish-screenshots: capturing Logic frame → ${logic_png}"
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "tapp logic" \
+  --test-dump-after-n-presents-png 2 "${logic_png}" \
+  --test-app-exit none
+
+echo "templelinux-publish-screenshots: capturing TempleOS game frame (KeepAway) → ${keepaway_png}"
+TEMPLE_HC_SEED=1 TEMPLE_HC_FIXED_TS=1 xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "tapp hc ::/Apps/KeepAway/Run.HC" \
+  --test-dump-app-png "${keepaway_png}" \
+  --test-app-exit esc
+
+echo "templelinux-publish-screenshots: capturing multi-window frame (Paint + Demo) → ${multi_png}"
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "tapp paint" \
+  --test-run-shell "tapp demo" \
+  --test-dump-after-n-apps-present-png 2 "${multi_png}"
+
+echo "templelinux-publish-screenshots: capturing multi-window frame (Paint + Demo + NetOfDots) → ${triple_png}"
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "tapp paint" \
+  --test-run-shell "tapp demo" \
+  --test-run-shell "tapp hc ::/Demo/Graphics/NetOfDots.HC" \
+  --test-dump-after-n-apps-present-png 3 "${triple_png}"
+
+echo "templelinux-publish-screenshots: capturing TempleOS game frame (TicTacToe.HC) → ${tictactoe_png}"
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "tapp hc ::/Demo/Games/TicTacToe.HC" \
+  --test-dump-after-n-presents-png 2 "${tictactoe_png}" \
+  --test-app-exit none
+
+echo "templelinux-publish-screenshots: capturing TempleOS game frame (CharDemo.HC) → ${chardemo_png}"
+TEMPLE_HC_SEED=1 xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "tapp hc ::/Demo/Games/CharDemo.HC" \
+  --test-dump-app-png "${chardemo_png}" \
+  --test-app-exit esc
+
+echo "templelinux-publish-screenshots: capturing TempleOS demo frame (Lines.HC) → ${lines_png}"
+TEMPLE_HC_SEED=1 xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "tapp hc ::/Demo/Graphics/Lines.HC" \
+  --test-dump-after-n-presents-png 1100 "${lines_png}"
+
+echo "templelinux-publish-screenshots: capturing TempleOS demo frame (SpritePlot.HC, sprites) → ${spriteplot_png}"
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "tapp hc ::/Demo/Graphics/SpritePlot.HC" \
+  --test-dump-after-n-presents-png 2 "${spriteplot_png}"
+
+echo "templelinux-publish-screenshots: capturing TempleOS demo frame (Slider.HC, controls) → ${slider_png}"
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "tapp hc ::/Demo/Graphics/Slider.HC" \
+  --test-dump-app-png "${slider_png}" \
+  --test-app-exit enter
+
+echo "templelinux-publish-screenshots: capturing TempleOS demo frame (WallPaperCtrl.HC wrapper, controls) → ${wallpaperctrl_png}"
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "tapp wallpaperctrl" \
+  --test-dump-app-png "${wallpaperctrl_png}" \
+  --test-app-exit esc
+
+echo "templelinux-publish-screenshots: capturing wallpaper desktop frame (WallPaperFish background + Demo window) → ${wallpaperfish_png}"
+TEMPLE_HC_SEED=1 TEMPLE_HC_FIXED_TS=0 xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "tapp wallpaperfish" \
+  --test-run-shell "tapp demo" \
+  --test-dump-after-n-apps-present-png 2 "${wallpaperfish_png}"
+
+echo "templelinux-publish-screenshots: capturing TempleOS demo frame (ScrollBars.HC) → ${scrollbars_png}"
+TEMPLE_HC_SEED=1 xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "tapp hc ::/Demo/Graphics/ScrollBars.HC" \
+  --test-dump-app-png "${scrollbars_png}" \
+  --test-app-exit enter
+
+echo "templelinux-publish-screenshots: capturing TempleOS demo frame (Grid.HC, mouse overlay) → ${grid_png}"
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "tapp hc ::/Demo/Graphics/Grid.HC" \
+  --test-dump-app-png "${grid_png}" \
+  --test-app-exit mouseleft
+
+echo "templelinux-publish-screenshots: capturing TempleOS demo frame (Palette.HC, palette changes) → ${palette_png}"
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-run-shell "tapp hc ::/Demo/Graphics/Palette.HC" \
+  --test-dump-after-n-presents-png 17 "${palette_png}" \
+  --test-app-exit none
+
+demo="::/Demo/Graphics/NetOfDots.HC"
+demo_png="${out_dir}/netofdots.png"
+pulldown_demo="::/Demo/PullDownMenu.HC"
+edit_png="${out_dir}/editor.png"
+edit_err_png="${out_dir}/editor-error-jump.png"
+edit_file="${out_dir}/editor-sample.txt"
+edit_err_file="${out_dir}/editor-error-sample.HC"
+
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp}"
+uniq="$(date +%s%N)-$$"
+sock="${runtime_dir}/templeshell-publish-${uniq}.sock"
+export TEMPLE_SOCK="${sock}"
+sock2=""
+sock_edit_err=""
+sock_pulldown=""
+
+cleanup() {
+  rm -f "${sock}" 2>/dev/null || true
+  if [[ -n "${sock2}" ]]; then
+    rm -f "${sock2}" 2>/dev/null || true
+  fi
+  if [[ -n "${sock_edit_err}" ]]; then
+    rm -f "${sock_edit_err}" 2>/dev/null || true
+  fi
+  if [[ -n "${sock_pulldown}" ]]; then
+    rm -f "${sock_pulldown}" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+echo "templelinux-publish-screenshots: capturing demo frame (${demo}) → ${demo_png}"
+
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen --test-dump-app-png "${demo_png}" &
+shell_pid=$!
+
+for _ in {1..200}; do
+  if [[ -S "${sock}" ]]; then
+    break
+  fi
+  if ! kill -0 "${shell_pid}" 2>/dev/null; then
+    echo "templelinux-publish-screenshots: templeshell exited before creating ${sock}" >&2
+    wait "${shell_pid}" || true
+    exit 1
+  fi
+  sleep 0.05
+done
+
+if [[ ! -S "${sock}" ]]; then
+  echo "templelinux-publish-screenshots: timed out waiting for ${sock}" >&2
+  kill "${shell_pid}" 2>/dev/null || true
+  wait "${shell_pid}" || true
+  exit 1
+fi
+
+"${temple_hc_bin}" "${demo}"
+wait "${shell_pid}" || true
+
+uniq_pulldown="$(date +%s%N)-$$"
+sock_pulldown="${runtime_dir}/templeshell-publish-${uniq_pulldown}.sock"
+export TEMPLE_SOCK="${sock_pulldown}"
+
+echo "templelinux-publish-screenshots: capturing demo frame (${pulldown_demo}) → ${pulldown_png}"
+
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-send-after-first-app-present "mouse_move:1,0" \
+  --test-dump-after-n-presents-png 20 "${pulldown_png}" \
+  --test-app-exit esc &
+shell_pulldown_pid=$!
+
+for _ in {1..200}; do
+  if [[ -S "${sock_pulldown}" ]]; then
+    break
+  fi
+  if ! kill -0 "${shell_pulldown_pid}" 2>/dev/null; then
+    echo "templelinux-publish-screenshots: templeshell exited before creating ${sock_pulldown}" >&2
+    wait "${shell_pulldown_pid}" || true
+    exit 1
+  fi
+  sleep 0.05
+done
+
+if [[ ! -S "${sock_pulldown}" ]]; then
+  echo "templelinux-publish-screenshots: timed out waiting for ${sock_pulldown}" >&2
+  kill "${shell_pulldown_pid}" 2>/dev/null || true
+  wait "${shell_pulldown_pid}" || true
+  exit 1
+fi
+
+"${temple_hc_bin}" "${pulldown_demo}"
+wait "${shell_pulldown_pid}" || true
+
+cat >"${edit_file}" <<'EOF'
+// TempleLinux editor demo
+//
+// Keys:
+//   Ctrl+S save   Ctrl+Q quit
+//   Ctrl+F find   F3 next
+//   Shift+arrows selection
+//   Ctrl+C copy   Ctrl+X cut
+//
+// Try: press F1 on GrLine (if docs exist).
+GrLine
+EOF
+
+uniq2="$(date +%s%N)-$$"
+sock2="${runtime_dir}/templeshell-publish-${uniq2}.sock"
+export TEMPLE_SOCK="${sock2}"
+
+echo "templelinux-publish-screenshots: capturing editor frame → ${edit_png}"
+
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen --test-dump-app-png "${edit_png}" --test-app-exit ctrlq &
+shell2_pid=$!
+
+for _ in {1..200}; do
+  if [[ -S "${sock2}" ]]; then
+    break
+  fi
+  if ! kill -0 "${shell2_pid}" 2>/dev/null; then
+    echo "templelinux-publish-screenshots: templeshell exited before creating ${sock2}" >&2
+    wait "${shell2_pid}" || true
+    exit 1
+  fi
+  sleep 0.05
+done
+
+if [[ ! -S "${sock2}" ]]; then
+  echo "templelinux-publish-screenshots: timed out waiting for ${sock2}" >&2
+  kill "${shell2_pid}" 2>/dev/null || true
+  wait "${shell2_pid}" || true
+  exit 1
+fi
+
+"${temple_edit_bin}" "${edit_file}"
+wait "${shell2_pid}" || true
+
+cat >"${edit_err_file}" <<'EOF'
+// HolyC error jump demo (F5 run).
+//
+// Press F5 to "run". The editor will compile-check via temple-hc --check,
+// then jump to the first compile error location.
+U0 Main() {
+  I64 x = ;
+}
+EOF
+
+uniq3="$(date +%s%N)-$$"
+sock_edit_err="${runtime_dir}/templeshell-publish-${uniq3}.sock"
+export TEMPLE_SOCK="${sock_edit_err}"
+
+echo "templelinux-publish-screenshots: capturing editor error jump frame → ${edit_err_png}"
+
+xvfb-run -a -s "${xvfb_args}" \
+  "${templeshell_bin}" --no-fullscreen \
+  --test-send-after-first-app-present "key:f5,down" \
+  --test-send-after-first-app-present "key:f5,up" \
+  --test-dump-after-n-presents-png 30 "${edit_err_png}" \
+  --test-app-exit ctrlq &
+shell3_pid=$!
+
+for _ in {1..200}; do
+  if [[ -S "${sock_edit_err}" ]]; then
+    break
+  fi
+  if ! kill -0 "${shell3_pid}" 2>/dev/null; then
+    echo "templelinux-publish-screenshots: templeshell exited before creating ${sock_edit_err}" >&2
+    wait "${shell3_pid}" || true
+    exit 1
+  fi
+  sleep 0.05
+done
+
+if [[ ! -S "${sock_edit_err}" ]]; then
+  echo "templelinux-publish-screenshots: timed out waiting for ${sock_edit_err}" >&2
+  kill "${shell3_pid}" 2>/dev/null || true
+  wait "${shell3_pid}" || true
+  exit 1
+fi
+
+"${temple_edit_bin}" "${edit_err_file}"
+wait "${shell3_pid}" || true
+
+index_html="${out_dir}/index.html"
+created_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+cat >"${index_html}" <<EOF
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TempleLinux screenshots (${created_utc})</title>
+<style>
+  :root {
+    --bg: #000;
+    --fg: #fff;
+    --muted: #aaa;
+    --frame: #444;
+  }
+  body {
+    margin: 24px;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    line-height: 1.4;
+  }
+  a { color: #7aa2ff; }
+  .meta { color: var(--muted); margin-bottom: 16px; }
+  .shot { margin: 18px 0; }
+  .shot h2 { font-size: 14px; font-weight: 600; margin: 0 0 8px 0; }
+  img {
+    width: min(1280px, 100%);
+    height: auto;
+    border: 2px solid var(--frame);
+    image-rendering: pixelated;
+  }
+</style>
+
+<h1>TempleLinux screenshots</h1>
+<div class="meta">Generated: ${created_utc} (UTC)</div>
+
+<div class="shot">
+  <h2>TempleShell (initial)</h2>
+  <a href="templeshell-initial.png">open PNG</a><br>
+  <img src="templeshell-initial.png" alt="TempleShell initial">
+</div>
+
+<div class="shot">
+  <h2>TempleShell file browser (files)</h2>
+  <a href="filebrowser.png">open PNG</a><br>
+  <img src="filebrowser.png" alt="File browser">
+</div>
+
+<div class="shot">
+  <h2>TempleShell launcher (apps)</h2>
+  <a href="applauncher.png">open PNG</a><br>
+  <img src="applauncher.png" alt="App launcher">
+</div>
+
+<div class="shot">
+  <h2>TempleOS: PersonalMenu.DD (icons)</h2>
+  <a href="personalmenu.png">open PNG</a><br>
+  <img src="personalmenu.png" alt="PersonalMenu icons">
+</div>
+
+<div class="shot">
+  <h2>TempleOS DolDoc: DemoIndex.DD (via help)</h2>
+  <a href="doldoc-demoindex.png">open PNG</a><br>
+  <img src="doldoc-demoindex.png" alt="DolDoc DemoIndex">
+</div>
+
+<div class="shot">
+  <h2>TempleOS DolDoc: DolDocOverview.DD (escaped '$' + literal cmds)</h2>
+  <a href="doldoc-overview.png">open PNG</a><br>
+  <img src="doldoc-overview.png" alt="DolDoc Overview">
+</div>
+
+<div class="shot">
+  <h2>TempleOS DolDoc: Job.DD (columns + sprite tags)</h2>
+  <a href="doldoc-job.png">open PNG</a><br>
+  <img src="doldoc-job.png" alt="DolDoc Job">
+</div>
+
+<div class="shot">
+  <h2>TempleOS DolDoc: HelpIndex.DD (sprites)</h2>
+  <a href="doldoc-helpindex.png">open PNG</a><br>
+  <img src="doldoc-helpindex.png" alt="DolDoc HelpIndex">
+</div>
+
+<div class="shot">
+  <h2>LinuxBridge (host integration)</h2>
+  <a href="linuxbridge.png">open PNG</a><br>
+  <img src="linuxbridge.png" alt="LinuxBridge">
+</div>
+
+<div class="shot">
+  <h2>TimeClock (upstream ::/Apps/TimeClock via wrapper)</h2>
+  <a href="timeclock.png">open PNG</a><br>
+  <img src="timeclock.png" alt="TimeClock">
+</div>
+
+<div class="shot">
+  <h2>Logic (upstream ::/Apps/Logic)</h2>
+  <a href="logic.png">open PNG</a><br>
+  <img src="logic.png" alt="Logic app">
+</div>
+
+<div class="shot">
+  <h2>KeepAway (upstream ::/Apps/KeepAway)</h2>
+  <a href="keepaway.png">open PNG</a><br>
+  <img src="keepaway.png" alt="KeepAway game">
+</div>
+
+<div class="shot">
+  <h2>Multi-window: Paint + Demo</h2>
+  <a href="multiwindow.png">open PNG</a><br>
+  <img src="multiwindow.png" alt="Paint and Demo windows">
+</div>
+
+<div class="shot">
+  <h2>Multi-window: Paint + Demo + NetOfDots.HC</h2>
+  <a href="triplewindow.png">open PNG</a><br>
+  <img src="triplewindow.png" alt="Paint, Demo, and NetOfDots windows">
+</div>
+
+<div class="shot">
+  <h2>TempleOS demo: NetOfDots.HC (first frame)</h2>
+  <a href="netofdots.png">open PNG</a><br>
+  <img src="netofdots.png" alt="NetOfDots demo">
+</div>
+
+<div class="shot">
+  <h2>TempleOS game: TicTacToe.HC</h2>
+  <a href="tictactoe.png">open PNG</a><br>
+  <img src="tictactoe.png" alt="TicTacToe game">
+</div>
+
+<div class="shot">
+  <h2>TempleOS game: CharDemo.HC</h2>
+  <a href="chardemo.png">open PNG</a><br>
+  <img src="chardemo.png" alt="CharDemo game">
+</div>
+
+<div class="shot">
+  <h2>TempleOS demo: PullDownMenu.HC (menu interaction)</h2>
+  <a href="pulldownmenu.png">open PNG</a><br>
+  <img src="pulldownmenu.png" alt="Pull-down menu demo">
+</div>
+
+<div class="shot">
+  <h2>TempleOS demo: Lines.HC (after 1100 presents)</h2>
+  <a href="lines.png">open PNG</a><br>
+  <img src="lines.png" alt="Lines demo">
+</div>
+
+<div class="shot">
+  <h2>TempleOS demo: SpritePlot.HC (sprite via \$IB)</h2>
+  <a href="spriteplot.png">open PNG</a><br>
+  <img src="spriteplot.png" alt="SpritePlot demo">
+</div>
+
+<div class="shot">
+  <h2>TempleOS demo: Slider.HC (controls)</h2>
+  <a href="slider.png">open PNG</a><br>
+  <img src="slider.png" alt="Slider demo">
+</div>
+
+<div class="shot">
+  <h2>TempleOS demo: WallPaperCtrl.HC (wrapper; controls)</h2>
+  <a href="wallpaperctrl.png">open PNG</a><br>
+  <img src="wallpaperctrl.png" alt="WallPaperCtrl demo">
+</div>
+
+<div class="shot">
+  <h2>TempleOS wallpaper: WallPaperFish.HC (background)</h2>
+  <a href="wallpaperfish.png">open PNG</a><br>
+  <img src="wallpaperfish.png" alt="WallPaperFish wallpaper">
+</div>
+
+<div class="shot">
+  <h2>TempleOS demo: ScrollBars.HC</h2>
+  <a href="scrollbars.png">open PNG</a><br>
+  <img src="scrollbars.png" alt="ScrollBars demo">
+</div>
+
+<div class="shot">
+  <h2>TempleOS demo: Grid.HC (grid snapping + custom mouse draw)</h2>
+  <a href="grid.png">open PNG</a><br>
+  <img src="grid.png" alt="Grid demo">
+</div>
+
+<div class="shot">
+  <h2>TempleOS demo: Palette.HC (palette changes)</h2>
+  <a href="palette.png">open PNG</a><br>
+  <img src="palette.png" alt="Palette demo">
+</div>
+
+<div class="shot">
+  <h2>Temple editor (temple-edit)</h2>
+  <a href="editor.png">open PNG</a><br>
+  <img src="editor.png" alt="Editor">
+</div>
+
+<div class="shot">
+  <h2>Temple editor: F5 run → jump to compile error</h2>
+  <a href="editor-error-jump.png">open PNG</a><br>
+  <img src="editor-error-jump.png" alt="Editor error jump">
+</div>
+EOF
+
+echo "templelinux-publish-screenshots: uploading via wtf-upload…"
+
+urls=()
+for file in "${index_html}" "${initial_png}" "${files_png}" "${apps_png}" "${personalmenu_png}" "${doldoc_png}" "${doldoc_overview_png}" "${doldoc_job_png}" "${doldoc_helpindex_png}" "${linuxbridge_png}" "${timeclock_png}" "${logic_png}" "${keepaway_png}" "${multi_png}" "${triple_png}" "${tictactoe_png}" "${chardemo_png}" "${demo_png}" "${pulldown_png}" "${lines_png}" "${spriteplot_png}" "${slider_png}" "${wallpaperctrl_png}" "${wallpaperfish_png}" "${scrollbars_png}" "${grid_png}" "${palette_png}" "${edit_png}" "${edit_err_png}"; do
+  base="$(basename "${file}")"
+  key="${prefix}/${base}"
+
+  if [[ "${base}" == "index.html" ]]; then
+    url="$(wtf-upload --key "${key}" --cache-control "no-cache" "${file}")"
+  else
+    url="$(wtf-upload --key "${key}" "${file}")"
+  fi
+
+  urls+=("${url}")
+  echo "${url}"
+done
+
+echo
+echo "templelinux-publish-screenshots: index:"
+echo "${urls[0]}"
