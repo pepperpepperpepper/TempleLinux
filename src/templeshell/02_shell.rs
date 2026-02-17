@@ -19,6 +19,47 @@ struct Shell {
     doc_viewer: Option<DocViewerState>,
 }
 
+const SHELL_COMMANDS: &[&str] = &[
+    "apps",
+    "browse",
+    "cat",
+    "cd",
+    "clear",
+    "clip",
+    "cp",
+    "edit",
+    "env",
+    "exit",
+    "files",
+    "find",
+    "fm",
+    "grep",
+    "hc",
+    "head",
+    "help",
+    "holyc",
+    "launcher",
+    "less",
+    "ls",
+    "menu",
+    "mkdir",
+    "more",
+    "mv",
+    "open",
+    "pwd",
+    "rm",
+    "run",
+    "screenshot",
+    "set",
+    "shot",
+    "shutdown",
+    "tail",
+    "tapp",
+    "touch",
+    "wc",
+    "ws",
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingWindowKind {
     Normal,
@@ -1211,6 +1252,9 @@ impl Shell {
                 changed = true;
                 self.submit_line(term);
             }
+            Key::Named(NamedKey::Tab) => {
+                changed = self.tab_complete(term) || changed;
+            }
             Key::Named(NamedKey::Backspace) => {
                 changed = true;
                 self.backspace();
@@ -1503,6 +1547,187 @@ impl Shell {
             return;
         }
         self.input.remove(self.cursor);
+    }
+
+    fn tab_complete(&mut self, term: &mut Terminal) -> bool {
+        fn common_prefix(items: &[String]) -> String {
+            let Some(first) = items.first() else {
+                return String::new();
+            };
+            let mut prefix = first.clone();
+            for item in items.iter().skip(1) {
+                while !item.starts_with(&prefix) {
+                    prefix.pop();
+                    if prefix.is_empty() {
+                        return prefix;
+                    }
+                }
+            }
+            prefix
+        }
+
+        fn print_matches(term: &mut Terminal, matches: &[String]) {
+            use fmt::Write as _;
+
+            let max_show = 40usize;
+            let shown: Vec<&str> = matches.iter().take(max_show).map(|s| s.as_str()).collect();
+            if matches.len() <= max_show {
+                let _ = writeln!(term, "matches: {}", shown.join("  "));
+            } else {
+                let _ = writeln!(
+                    term,
+                    "matches: {}  ... (+{} more)",
+                    shown.join("  "),
+                    matches.len() - max_show
+                );
+            }
+        }
+
+        let cursor = self.cursor.min(self.input.len());
+        let before = &self.input[..cursor];
+        let token_start = before
+            .rfind(|ch: char| ch.is_whitespace())
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let token_end = self.input[cursor..]
+            .find(|ch: char| ch.is_whitespace())
+            .map(|i| cursor + i)
+            .unwrap_or(self.input.len());
+
+        let prefix = self.input[token_start..cursor].to_string();
+        if prefix.is_empty() {
+            return false;
+        }
+
+        let is_first_token = self.input[..token_start].trim().is_empty();
+        if is_first_token {
+            let mut matches: Vec<String> = SHELL_COMMANDS
+                .iter()
+                .copied()
+                .filter(|cmd| cmd.starts_with(&prefix))
+                .map(|s| s.to_string())
+                .collect();
+            matches.sort_unstable();
+            matches.dedup();
+            if matches.is_empty() {
+                return false;
+            }
+
+            if matches.len() == 1 {
+                let mut completion = matches[0].clone();
+                let has_space_after = self
+                    .input
+                    .get(token_end..)
+                    .and_then(|s| s.chars().next())
+                    .is_some_and(|ch| ch.is_whitespace());
+                if !has_space_after {
+                    completion.push(' ');
+                }
+                self.input.replace_range(token_start..token_end, &completion);
+                self.cursor = token_start + completion.len();
+                return true;
+            }
+
+            let common = common_prefix(&matches);
+            if common.len() > prefix.len() {
+                self.input.replace_range(token_start..token_end, &common);
+                self.cursor = token_start + common.len();
+                return true;
+            }
+
+            print_matches(term, &matches);
+            return true;
+        }
+
+        let (mode_prefix, path_part) = if prefix.starts_with("::/") {
+            ("::/", prefix.trim_start_matches("::/"))
+        } else {
+            ("", prefix.as_str())
+        };
+
+        let (dir_part, base_part) = match path_part.rfind('/') {
+            Some(idx) => (&path_part[..idx + 1], &path_part[idx + 1..]),
+            None => ("", path_part),
+        };
+
+        let host_dir = if mode_prefix == "::/" {
+            let Some(root) = discover_templeos_root() else {
+                return false;
+            };
+            let rel = dir_part.trim_start_matches('/');
+            if rel.is_empty() {
+                root
+            } else {
+                root.join(rel)
+            }
+        } else {
+            let path = if dir_part.starts_with('/') {
+                TemplePath::root().resolve(dir_part)
+            } else {
+                self.cwd.resolve(dir_part)
+            };
+            path.to_host_path(&self.root_dir)
+        };
+
+        let Ok(read_dir) = std::fs::read_dir(&host_dir) else {
+            return false;
+        };
+
+        let mut matches: Vec<String> = Vec::new();
+        for entry in read_dir.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(base_part) {
+                continue;
+            }
+            let shown = match entry.file_type() {
+                Ok(ft) if ft.is_dir() => format!("{name}/"),
+                _ => name,
+            };
+            matches.push(shown);
+        }
+        matches.sort_unstable();
+        matches.dedup();
+        if matches.is_empty() {
+            return false;
+        }
+
+        if matches.len() == 1 {
+            let chosen = matches.remove(0);
+            let mut completion = String::new();
+            completion.push_str(mode_prefix);
+            completion.push_str(dir_part);
+            completion.push_str(&chosen);
+
+            let is_dir = chosen.ends_with('/');
+            if !is_dir {
+                let has_space_after = self
+                    .input
+                    .get(token_end..)
+                    .and_then(|s| s.chars().next())
+                    .is_some_and(|ch| ch.is_whitespace());
+                if !has_space_after {
+                    completion.push(' ');
+                }
+            }
+
+            self.input.replace_range(token_start..token_end, &completion);
+            self.cursor = token_start + completion.len();
+            return true;
+        }
+
+        let common = common_prefix(&matches);
+        if common.len() > base_part.len() {
+            let mut completion = String::new();
+            completion.push_str(mode_prefix);
+            completion.push_str(dir_part);
+            completion.push_str(&common);
+            self.input.replace_range(token_start..token_end, &completion);
+            self.cursor = token_start + completion.len();
+            return true;
+        }
+
+        print_matches(term, &matches);
+        true
     }
 
     fn history_prev(&mut self) {

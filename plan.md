@@ -1726,6 +1726,9 @@ Quality-of-life items that dramatically improve “OS feel”:
 - A visible status line: time, active app/window, workspace hint, last error.
 - A small “notifications” log inside TempleShell for app crashes and IPC errors.
 
+Progress notes (2026-02-17):
+- Implemented prompt Tab completion for built-in commands and paths (Temple root), with `::/` completion for the vendored TempleOS tree when `TEMPLEOS_ROOT` is discoverable.
+
 ---
 
 ## 22) Linux integration philosophy (to stay TempleOS-ish)
