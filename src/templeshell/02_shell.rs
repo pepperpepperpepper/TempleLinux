@@ -48,18 +48,7 @@ struct BuiltDoc {
 
 impl Shell {
     fn new(test_mode: bool) -> Self {
-        let root_dir = if test_mode {
-            let uniq = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            std::env::temp_dir().join(format!(
-                "templelinux-test-root-{uniq}-{}",
-                std::process::id()
-            ))
-        } else {
-            default_temple_root()
-        };
+        let root_dir = pick_temple_root(test_mode);
         let _ = std::fs::create_dir_all(&root_dir);
         let _ = std::fs::create_dir_all(root_dir.join("Home"));
         let _ = std::fs::create_dir_all(root_dir.join("Doc"));

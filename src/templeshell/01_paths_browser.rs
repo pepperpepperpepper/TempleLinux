@@ -1,9 +1,37 @@
 fn default_temple_root() -> PathBuf {
+    if let Ok(v) = std::env::var("TEMPLE_ROOT") {
+        let v = v.trim();
+        if !v.is_empty() {
+            return PathBuf::from(v);
+        }
+    }
     if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home).join(".templelinux")
     } else {
         PathBuf::from(".templelinux")
     }
+}
+
+fn pick_temple_root(test_mode: bool) -> PathBuf {
+    if test_mode {
+        if let Ok(v) = std::env::var("TEMPLE_ROOT") {
+            let v = v.trim();
+            if !v.is_empty() {
+                return PathBuf::from(v);
+            }
+        }
+
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        return std::env::temp_dir().join(format!(
+            "templelinux-test-root-{uniq}-{}",
+            std::process::id()
+        ));
+    }
+
+    default_temple_root()
 }
 
 #[derive(Clone, Debug, Default)]

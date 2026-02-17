@@ -1264,6 +1264,14 @@ Progress notes (2026-02-17):
   - Committed the captured PNGs + `index.html` under `docs/screenshots/2026-02-17/` and updated `README.md` to reference them.
 - Tweaked the screenshot publisher so editor sample files are created in a temp dir (keeps `docs/screenshots/.../` clean).
 - Uploaded `research.md` to Open WebUI via `chat-uh-oh-from-file`: `https://chat.uh-oh.wtf/c/578f7929-e2d0-49e2-a415-d561670923d3`
+- Implemented startup/session spec basics in `templeshell`:
+  - `TEMPLE_ROOT` is honored (and created with `Home/`, `Doc/`, `Cfg/`, `Apps/`) before graphics init.
+  - `TEMPLEOS_ROOT` validation is stricter (requires `Kernel/FontStd.HC` and `Adam/Gr/GrPalette.HC`) and fails fast with a clear message if missing.
+  - Added CLI flags: `--config` (TEMPLE_ROOT), `--os-root` (TEMPLEOS_ROOT), `--sock` (TEMPLE_SOCK); default socket is `$XDG_RUNTIME_DIR/temple.sock` or `$TEMPLE_ROOT/temple.sock`.
+- Implemented additional startup/session spec behavior in `templeshell`:
+  - Focus loss enters a paused state (host input ignored) and status line shows `Paused (focus lost)`.
+  - While paused, app `Present()` messages are ACKed immediately without forcing redraw (avoids client stalls when `TEMPLE_SYNC_PRESENT=1`).
+  - Graceful shutdown sends `MSG_SHUTDOWN` to connected apps, unlinks the socket file, and waits briefly (100ms) for clients to disconnect.
 
 ### Milestone 39: Distribution packages (Arch + Ubuntu)
 Status (2026-02-17): Completed (priority; “install on top of” existing distros)

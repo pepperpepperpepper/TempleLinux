@@ -59,6 +59,9 @@ impl HostClipboard {
 #[derive(Debug, Default)]
 struct CliArgs {
     no_fullscreen: bool,
+    temple_root: Option<PathBuf>,
+    templeos_root: Option<PathBuf>,
+    temple_sock: Option<PathBuf>,
     test_dump_initial_png: Option<PathBuf>,
     test_dump_after_first_app_present_png: Option<PathBuf>,
     test_dump_after_n_apps_present_png: Option<(usize, PathBuf)>,

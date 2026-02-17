@@ -165,6 +165,7 @@ struct App {
     palette_stack: Vec<[[u8; 4]; 256]>,
     terminal: Terminal,
     shell: Shell,
+    temple_sock_path: Option<PathBuf>,
     wallpaper_app: Option<AppId>,
     wallpaper_title: Option<String>,
     mods: ModState,
@@ -178,6 +179,8 @@ struct App {
     mouse_capture_app: Option<AppId>,
     drag: Option<DragState>,
     windows: Vec<AppWindow>,
+    window_focused: bool,
+    shutdown_started: bool,
     test: Option<TestState>,
 }
 
@@ -244,6 +247,7 @@ impl App {
             palette_stack: Vec::new(),
             terminal,
             shell,
+            temple_sock_path: temple_sock,
             wallpaper_app: None,
             wallpaper_title: None,
             mods: ModState::default(),
@@ -257,6 +261,8 @@ impl App {
             mouse_capture_app: None,
             drag: None,
             windows: Vec::new(),
+            window_focused: true,
+            shutdown_started: false,
             test,
         };
         app.update_status_line();
@@ -283,6 +289,45 @@ impl App {
     fn set_cursor_output_pos(&mut self, pos: PhysicalPosition<f64>) {
         self.cursor_internal = self.letterbox().map_point_to_internal(pos);
         self.update_status_line();
+    }
+
+    fn graceful_shutdown(&mut self) {
+        if self.shutdown_started {
+            return;
+        }
+        self.shutdown_started = true;
+
+        // Best-effort persistence: state is usually flushed incrementally, but ensure we write
+        // whatever we can before exiting.
+        if self.test.is_none() {
+            self.shell.save_history();
+            self.shell.save_vars();
+        }
+
+        // Notify all connected apps.
+        let ids: Vec<AppId> = self.temple_apps.keys().copied().collect();
+        for id in ids {
+            let _ = self.send_app_msg(id, protocol::Msg::shutdown());
+        }
+
+        // Avoid leaving clients blocked on `Present()` when `TEMPLE_SYNC_PRESENT=1`.
+        self.flush_present_acks();
+
+        // Try to kill the last spawned `tapp` child (if any) to avoid leaving a stray process.
+        if let Some(mut child) = self.shell.tapp_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        // Cleanup the socket path so subsequent sessions don't trip over a stale file.
+        if let Some(sock) = self.temple_sock_path.as_ref() {
+            let _ = std::fs::remove_file(sock);
+        }
+
+        // Give clients a short chance to observe MSG_SHUTDOWN and disconnect.
+        if self.test.is_none() {
+            thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
 
     fn default_window_rect(&self, idx: usize) -> RectI32 {
@@ -578,7 +623,9 @@ impl App {
         let row = STATUS_ROW;
         self.terminal.fill_row(row, COLOR_FG, COLOR_STATUS_BG);
 
-        let app_state = if self.focused_app.is_some() {
+        let app_state = if !self.window_focused && self.test.is_none() {
+            "Paused (focus lost)"
+        } else if self.focused_app.is_some() {
             "App focused (Alt+Tab switch, Ctrl+W close; Esc forwarded)"
         } else if !self.windows.is_empty() {
             "Shell focused (click a window to focus)"
@@ -809,10 +856,17 @@ impl App {
     }
 }
 
-fn default_temple_sock_path() -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(format!("templeshell-{}.sock", std::process::id()));
-    path
+fn default_temple_sock_path(root_dir: &Path, test_mode: bool) -> PathBuf {
+    if !test_mode {
+        if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+            let runtime_dir = PathBuf::from(runtime_dir);
+            if !runtime_dir.as_os_str().is_empty() {
+                return runtime_dir.join("temple.sock");
+            }
+        }
+    }
+
+    root_dir.join("temple.sock")
 }
 
 fn print_usage() {
@@ -823,6 +877,9 @@ fn print_usage() {
     eprintln!();
     eprintln!("OPTIONS:");
     eprintln!("  --no-fullscreen                  Do not enter fullscreen");
+    eprintln!("  --config <path>                  Set TEMPLE_ROOT (default: $HOME/.templelinux)");
+    eprintln!("  --os-root <path>                 Set TEMPLEOS_ROOT (TempleOS tree root)");
+    eprintln!("  --sock <path>                    Set TEMPLE_SOCK (IPC socket path)");
     eprintln!("  --test-dump-initial-png <path>   Dump initial framebuffer to PNG and exit");
     eprintln!(
         "  --test-dump-app-png <path>       Wait for first app Present(), dump PNG, then exit after app disconnect"
@@ -849,6 +906,22 @@ fn parse_cli_args() -> Result<CliArgs, String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--no-fullscreen" => out.no_fullscreen = true,
+            "--config" => {
+                let path = args
+                    .next()
+                    .ok_or_else(|| "--config expects a path".to_string())?;
+                out.temple_root = Some(PathBuf::from(path));
+            }
+            "--os-root" => {
+                let path = args
+                    .next()
+                    .ok_or_else(|| "--os-root expects a path".to_string())?;
+                out.templeos_root = Some(PathBuf::from(path));
+            }
+            "--sock" => {
+                let path = args.next().ok_or_else(|| "--sock expects a path".to_string())?;
+                out.temple_sock = Some(PathBuf::from(path));
+            }
             "--test-dump-initial-png" => {
                 let path = args
                     .next()
@@ -1045,22 +1118,32 @@ fn parse_test_event_spec(spec: &str) -> Result<protocol::Msg, String> {
     }
 }
 
-fn ensure_temple_sock_from_env_or_default() -> PathBuf {
+fn ensure_temple_sock_from_env_or_default(root_dir: &Path, test_mode: bool) -> PathBuf {
     if let Some(path) = std::env::var_os("TEMPLE_SOCK") {
-        return PathBuf::from(path);
+        let path = PathBuf::from(path);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
     }
-    let temple_sock = default_temple_sock_path();
+    let temple_sock = default_temple_sock_path(root_dir, test_mode);
+    if let Some(parent) = temple_sock.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     unsafe {
         std::env::set_var("TEMPLE_SOCK", temple_sock.as_os_str());
     }
     temple_sock
 }
 
+fn is_valid_templeos_root(path: &Path) -> bool {
+    path.join("Kernel/FontStd.HC").exists() && path.join("Adam/Gr/GrPalette.HC").exists()
+}
+
 fn discover_templeos_root() -> Option<PathBuf> {
     if let Ok(v) = std::env::var("TEMPLEOS_ROOT") {
         if !v.trim().is_empty() {
             let p = PathBuf::from(v);
-            if p.join("Kernel/FontStd.HC").exists() {
+            if is_valid_templeos_root(&p) {
                 return Some(p);
             }
         }
@@ -1080,7 +1163,7 @@ fn discover_templeos_root() -> Option<PathBuf> {
         let mut dir = base.clone();
         for _ in 0..8usize {
             let candidate = dir.join("third_party/TempleOS");
-            if candidate.join("Kernel/FontStd.HC").exists() {
+            if is_valid_templeos_root(&candidate) {
                 return Some(candidate);
             }
             if !dir.pop() {
@@ -1090,7 +1173,7 @@ fn discover_templeos_root() -> Option<PathBuf> {
     }
 
     let sys = PathBuf::from("/usr/share/templelinux/TempleOS");
-    if sys.join("Kernel/FontStd.HC").exists() {
+    if is_valid_templeos_root(&sys) {
         return Some(sys);
     }
 
@@ -1537,6 +1620,68 @@ fn main() {
         }
     };
 
+    let test_mode = args.test_dump_initial_png.is_some()
+        || args.test_dump_after_first_app_present_png.is_some()
+        || args.test_dump_after_n_apps_present_png.is_some()
+        || args.test_dump_after_n_presents_png.is_some();
+
+    if let Some(root) = args.temple_root.take() {
+        unsafe {
+            std::env::set_var("TEMPLE_ROOT", root.as_os_str());
+        }
+    }
+    if let Some(root) = args.templeos_root.take() {
+        unsafe {
+            std::env::set_var("TEMPLEOS_ROOT", root.as_os_str());
+        }
+    }
+    if let Some(sock) = args.temple_sock.take() {
+        unsafe {
+            std::env::set_var("TEMPLE_SOCK", sock.as_os_str());
+        }
+    }
+
+    // Environment discovery phase (pre-graphics init).
+    let temple_root = pick_temple_root(test_mode);
+    unsafe {
+        std::env::set_var("TEMPLE_ROOT", temple_root.as_os_str());
+    }
+    let _ = std::fs::create_dir_all(&temple_root);
+    for dir in ["Home", "Doc", "Cfg", "Apps"] {
+        let _ = std::fs::create_dir_all(temple_root.join(dir));
+    }
+
+    if let Ok(v) = std::env::var("TEMPLEOS_ROOT") {
+        let v = v.trim();
+        if !v.is_empty() {
+            let p = PathBuf::from(v);
+            if !is_valid_templeos_root(&p) {
+                eprintln!("templeshell: TEMPLEOS_ROOT is set but invalid: {}", p.display());
+                eprintln!("templeshell: expected Kernel/FontStd.HC and Adam/Gr/GrPalette.HC");
+                eprintln!();
+                eprintln!("Fix:");
+                eprintln!("  - set TEMPLEOS_ROOT (or pass --os-root) to a valid TempleOS tree root, or");
+                eprintln!("  - ensure the TempleOS submodule is present (git submodule update --init --recursive), or");
+                eprintln!("  - install templelinux-templeos-data (system path: /usr/share/templelinux/TempleOS)");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let Some(templeos_root) = discover_templeos_root() else {
+        eprintln!("templeshell: TempleOS tree not found.");
+        eprintln!("templeshell: expected Kernel/FontStd.HC and Adam/Gr/GrPalette.HC.");
+        eprintln!();
+        eprintln!("Fix:");
+        eprintln!("  - set TEMPLEOS_ROOT (or pass --os-root), or");
+        eprintln!("  - ensure third_party/TempleOS is present (git submodule update --init --recursive), or");
+        eprintln!("  - install templelinux-templeos-data (system path: /usr/share/templelinux/TempleOS)");
+        std::process::exit(2);
+    };
+    unsafe {
+        std::env::set_var("TEMPLEOS_ROOT", templeos_root.as_os_str());
+    }
+
     let mut test = if let Some(path) = args.test_dump_initial_png {
         Some(TestState::dump_initial_frame(path))
     } else if let Some(path) = args.test_dump_after_first_app_present_png {
@@ -1556,7 +1701,7 @@ fn main() {
         test.run_shell = std::mem::take(&mut args.test_run_shell);
     }
 
-    let temple_sock = ensure_temple_sock_from_env_or_default();
+    let temple_sock = ensure_temple_sock_from_env_or_default(&temple_root, test_mode);
 
     let mut builder = EventLoopBuilder::<UserEvent>::with_user_event();
     let event_loop = builder.build().expect("event loop");
@@ -1690,7 +1835,11 @@ fn main() {
                         }
                     }
                     TempleIpcEvent::AppPresent { id, seq } => {
-                        if let Some(sess) = app.temple_apps.get_mut(&id) {
+                        if app.test.is_none() && !app.window_focused {
+                            // If we're unfocused, avoid rendering churn but ACK promptly so clients
+                            // don't stall when `TEMPLE_SYNC_PRESENT=1`.
+                            let _ = app.send_app_msg(id, protocol::Msg::present_ack(seq));
+                        } else if let Some(sess) = app.temple_apps.get_mut(&id) {
                             sess.pending_present_ack_seq = Some(seq);
                             window.request_redraw();
                         }
@@ -1717,7 +1866,33 @@ fn main() {
                 },
                 Event::WindowEvent { event, window_id } if window_id == main_window_id => {
                     match event {
-                        WindowEvent::CloseRequested => elwt.exit(),
+                        WindowEvent::CloseRequested => {
+                            app.graceful_shutdown();
+                            elwt.exit();
+                        }
+                        WindowEvent::Focused(focused) => {
+                            if app.test.is_some() {
+                                // In golden-test mode, ignore focus transitions.
+                            } else {
+                                app.window_focused = focused;
+
+                                // Flush input state on focus changes to avoid stuck modifiers after Alt+Tab.
+                                app.mods = ModState::default();
+
+                                if !focused {
+                                    app.cursor_internal = None;
+                                    app.drag = None;
+                                    app.mouse_left_down = false;
+                                    if let Some(id) = app.hovered_app.take() {
+                                        let _ = app.send_app_msg(id, protocol::Msg::mouse_leave());
+                                    }
+                                    app.mouse_capture_app = None;
+                                }
+
+                                app.update_status_line();
+                                window.request_redraw();
+                            }
+                        }
                         WindowEvent::Resized(new_size) => {
                             app.resize(new_size);
                             window.request_redraw();
@@ -1732,6 +1907,8 @@ fn main() {
                         WindowEvent::KeyboardInput { event, .. } => {
                             if app.test.is_some() {
                                 // In golden-test mode, ignore real keyboard input.
+                            } else if !app.window_focused {
+                                // Paused (focus lost): ignore host input.
                             } else {
                                 let down = event.state == ElementState::Pressed;
                                 app.mods.update(&event.logical_key, down);
@@ -1823,6 +2000,7 @@ fn main() {
                                 if event.logical_key == Key::Named(NamedKey::Escape)
                                     && !app.shell.in_browser()
                                 {
+                                    app.graceful_shutdown();
                                     elwt.exit();
                                     return;
                                 }
@@ -1853,6 +2031,7 @@ fn main() {
                                 }
 
                                 if app.shell.take_exit_requested() {
+                                    app.graceful_shutdown();
                                     elwt.exit();
                                     return;
                                 }
@@ -1864,6 +2043,8 @@ fn main() {
                                 // In golden-test mode we avoid forwarding real pointer events.
                                 // Xvfb pointer state can be nondeterministic, and Temple apps
                                 // (demo/paint/etc.) may render the pointer position.
+                            } else if !app.window_focused {
+                                // Paused (focus lost): ignore host input.
                             } else {
                             app.set_cursor_output_pos(position);
                             let Some((x_u, y_u)) = app.cursor_internal else {
@@ -1931,6 +2112,8 @@ fn main() {
                         WindowEvent::CursorLeft { .. } => {
                             if app.test.is_some() {
                                 // In golden-test mode, ignore real pointer events.
+                            } else if !app.window_focused {
+                                // Paused (focus lost): ignore host input.
                             } else {
                             app.cursor_internal = None;
                             app.drag = None;
@@ -1946,6 +2129,8 @@ fn main() {
                         WindowEvent::MouseInput { state, button, .. } => {
                             if app.test.is_some() {
                                 // In golden-test mode, ignore real pointer events.
+                            } else if !app.window_focused {
+                                // Paused (focus lost): ignore host input.
                             } else {
                             let down = state == ElementState::Pressed;
                             if button == MouseButton::Left {
@@ -2115,6 +2300,8 @@ fn main() {
                         WindowEvent::MouseWheel { delta, .. } => {
                             if app.test.is_some() {
                                 // In golden-test mode, ignore real pointer events.
+                            } else if !app.window_focused {
+                                // Paused (focus lost): ignore host input.
                             } else {
                             let mut sent_to_app = false;
                             if let Some((x_u, y_u)) = app.cursor_internal {
