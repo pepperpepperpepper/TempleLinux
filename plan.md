@@ -1272,6 +1272,9 @@ Progress notes (2026-02-17):
   - Focus loss enters a paused state (host input ignored) and status line shows `Paused (focus lost)`.
   - While paused, app `Present()` messages are ACKed immediately without forcing redraw (avoids client stalls when `TEMPLE_SYNC_PRESENT=1`).
   - Graceful shutdown sends `MSG_SHUTDOWN` to connected apps, unlinks the socket file, and waits briefly (100ms) for clients to disconnect.
+- Updated Linux workspace bridging to better match the session spec:
+  - `open`, `browse`, and `run` now attempt the Linux workspace switch *before* spawning the external process.
+  - Doc-viewer `templelinux:browse:` actions switch workspaces pre-spawn as well (and best-effort switch back on spawn failure).
 
 ### Milestone 39: Distribution packages (Arch + Ubuntu)
 Status (2026-02-17): Completed (priority; “install on top of” existing distros)

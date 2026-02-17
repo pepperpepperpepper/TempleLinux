@@ -763,34 +763,49 @@ impl Shell {
 	        use fmt::Write as _;
 
 	        let action = action.trim();
-	        if let Some(url) = action.strip_prefix("templelinux:browse:") {
-	            let url = url.trim();
-	            if url.is_empty() {
-	                return DocActionOutcome::Unsupported;
-	            }
+		        if let Some(url) = action.strip_prefix("templelinux:browse:") {
+		            let url = url.trim();
+		            if url.is_empty() {
+		                return DocActionOutcome::Unsupported;
+		            }
 
-	            match std::process::Command::new("xdg-open").arg(url).spawn() {
-	                Ok(child) => {
-	                    let mut msg = format!("browse pid {}", child.id());
-	                    if self.env_bool("TEMPLE_AUTO_LINUX_WS") {
-	                        let linux_ws = self.env_u32("TEMPLE_WS_LINUX", 2);
-	                        if let Err(err) = self.sway_workspace_number(linux_ws) {
-	                            msg.push_str(&format!("; ws: {err}"));
-	                        }
-	                    }
-	                    if let Some(state) = self.doc_viewer.as_mut() {
-	                        state.msg = msg;
-	                    }
-	                    return DocActionOutcome::KeepDocViewer;
-	                }
-	                Err(err) => {
-	                    if let Some(state) = self.doc_viewer.as_mut() {
-	                        state.msg = format!("browse: xdg-open: {err}");
-	                    }
-	                    return DocActionOutcome::KeepDocViewer;
-	                }
-	            }
-	        }
+		            let (did_switch, ws_err) = if self.env_bool("TEMPLE_AUTO_LINUX_WS") {
+		                let linux_ws = self.env_u32("TEMPLE_WS_LINUX", 2);
+		                match self.sway_workspace_number(linux_ws) {
+		                    Ok(()) => (true, None),
+		                    Err(err) => (false, Some(err)),
+		                }
+		            } else {
+		                (false, None)
+		            };
+
+		            match std::process::Command::new("xdg-open").arg(url).spawn() {
+		                Ok(child) => {
+		                    let mut msg = format!("browse pid {}", child.id());
+		                    if let Some(err) = ws_err.as_deref() {
+		                        msg.push_str(&format!("; ws: {err}"));
+		                    }
+		                    if let Some(state) = self.doc_viewer.as_mut() {
+		                        state.msg = msg;
+		                    }
+		                    return DocActionOutcome::KeepDocViewer;
+		                }
+		                Err(err) => {
+		                    if did_switch {
+		                        let temple_ws = self.env_u32("TEMPLE_WS_TEMPLE", 1);
+		                        let _ = self.sway_workspace_number(temple_ws);
+		                    }
+		                    if let Some(state) = self.doc_viewer.as_mut() {
+		                        let mut msg = format!("browse: xdg-open: {err}");
+		                        if let Some(ws_err) = ws_err.as_deref() {
+		                            msg.push_str(&format!("; ws: {ws_err}"));
+		                        }
+		                        state.msg = msg;
+		                    }
+		                    return DocActionOutcome::KeepDocViewer;
+		                }
+		            }
+		        }
 
 	        if action.starts_with("templelinux:song:") {
 	            if let Some(state) = self.doc_viewer.as_mut() {
@@ -4049,15 +4064,18 @@ impl Shell {
 
         let path = self.cwd.resolve(target);
         let host = path.to_host_path(&self.root_dir);
+        let switched = self.maybe_auto_linux_ws(term);
         let res = std::process::Command::new("xdg-open").arg(&host).spawn();
 
         use fmt::Write as _;
         match res {
             Ok(child) => {
                 let _ = writeln!(term, "open: launched pid {}", child.id());
-                self.maybe_auto_linux_ws(term);
             }
             Err(err) => {
+                if switched {
+                    self.maybe_auto_temple_ws(term);
+                }
                 let _ = writeln!(term, "open: xdg-open: {err}");
             }
         }
@@ -4070,15 +4088,18 @@ impl Shell {
             return;
         };
 
+        let switched = self.maybe_auto_linux_ws(term);
         let res = std::process::Command::new("xdg-open").arg(url).spawn();
 
         use fmt::Write as _;
         match res {
             Ok(child) => {
                 let _ = writeln!(term, "browse: launched pid {}", child.id());
-                self.maybe_auto_linux_ws(term);
             }
             Err(err) => {
+                if switched {
+                    self.maybe_auto_temple_ws(term);
+                }
                 let _ = writeln!(term, "browse: xdg-open: {err}");
             }
         }
@@ -4123,12 +4144,27 @@ impl Shell {
         }
     }
 
-    fn maybe_auto_linux_ws(&self, term: &mut Terminal) {
+    fn maybe_auto_linux_ws(&self, term: &mut Terminal) -> bool {
+        if !self.env_bool("TEMPLE_AUTO_LINUX_WS") {
+            return false;
+        }
+        let linux_ws = self.env_u32("TEMPLE_WS_LINUX", 2);
+        match self.sway_workspace_number(linux_ws) {
+            Ok(()) => true,
+            Err(err) => {
+                use fmt::Write as _;
+                let _ = writeln!(term, "ws: {err}");
+                false
+            }
+        }
+    }
+
+    fn maybe_auto_temple_ws(&self, term: &mut Terminal) {
         if !self.env_bool("TEMPLE_AUTO_LINUX_WS") {
             return;
         }
-        let linux_ws = self.env_u32("TEMPLE_WS_LINUX", 2);
-        if let Err(err) = self.sway_workspace_number(linux_ws) {
+        let temple_ws = self.env_u32("TEMPLE_WS_TEMPLE", 1);
+        if let Err(err) = self.sway_workspace_number(temple_ws) {
             use fmt::Write as _;
             let _ = writeln!(term, "ws: {err}");
         }
@@ -4197,6 +4233,7 @@ impl Shell {
             return;
         };
 
+        let switched = self.maybe_auto_linux_ws(term);
         let host_cwd = self.cwd.to_host_path(&self.root_dir);
         let res = std::process::Command::new(program)
             .args(&args[1..])
@@ -4209,6 +4246,9 @@ impl Shell {
                 let _ = writeln!(term, "run: launched pid {}", child.id());
             }
             Err(err) => {
+                if switched {
+                    self.maybe_auto_temple_ws(term);
+                }
                 let _ = writeln!(term, "run: {program}: {err}");
             }
         }
