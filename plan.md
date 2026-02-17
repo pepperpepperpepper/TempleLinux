@@ -1728,6 +1728,7 @@ Quality-of-life items that dramatically improve “OS feel”:
 
 Progress notes (2026-02-17):
 - Implemented prompt Tab completion for built-in commands and paths (Temple root), with `::/` completion for the vendored TempleOS tree when `TEMPLEOS_ROOT` is discoverable.
+- Expanded `help` output: categorized command list with usage, docs pointers, and a built-in `help keymap` page (also used when TempleOS DolDoc macros request `KeyMap`).
 
 ---
 

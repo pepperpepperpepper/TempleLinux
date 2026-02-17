@@ -1114,7 +1114,8 @@ impl Shell {
             }
         }
 
-        if want_keymap && self.try_show_doc("::/Doc/KeyMap.DD", term) {
+        if want_keymap {
+            self.open_keymap_doc(term);
             return DocActionOutcome::KeepDocViewer;
         }
 
@@ -1845,62 +1846,132 @@ impl Shell {
     fn cmd_help(&mut self, args: &[&str], term: &mut Terminal) {
         use fmt::Write as _;
         if args.is_empty() {
-            let _ = writeln!(term, "Commands:");
-            let _ = writeln!(term, "  help [cmd]   Show help");
-            let _ = writeln!(term, "  clear        Clear output");
-            let _ = writeln!(term, "  ls [path]    List directory");
-            let _ = writeln!(term, "  cd [path]    Change directory");
-            let _ = writeln!(term, "  pwd          Print working directory");
-            let _ = writeln!(term, "  cat <path>   Print file");
-            let _ = writeln!(term, "  cp <a> <b>   Copy file");
-            let _ = writeln!(term, "  mv <a> <b>   Move/rename");
-            let _ = writeln!(term, "  rm <path>    Remove file");
-            let _ = writeln!(term, "  mkdir <path> Make directory");
-            let _ = writeln!(term, "  touch <path> Create empty file");
-            let _ = writeln!(term, "  grep <s> <p> Search file");
-            let _ = writeln!(term, "  find [p] [s] Find files (substring)");
-            let _ = writeln!(term, "  head <path>  First lines");
-            let _ = writeln!(term, "  tail <path>  Last lines");
-            let _ = writeln!(term, "  wc <path>    Count lines/words/bytes");
-            let _ = writeln!(term, "  more <path>  Pager");
-            let _ = writeln!(term, "  less <path>  Pager");
-            let _ = writeln!(term, "  clip <cmd>   Host clipboard (get/set)");
-            let _ = writeln!(term, "  env          Show TempleShell vars");
-            let _ = writeln!(term, "  set <k=v>    Set TempleShell var");
-            let _ = writeln!(term, "  open <path>  Open file with xdg-open");
-            let _ = writeln!(term, "  browse <url> Open URL with xdg-open");
-            let _ = writeln!(term, "  screenshot   Save a PNG screenshot");
-            let _ = writeln!(term, "  run <cmd>    Launch a Linux command");
-            let _ = writeln!(term, "  shutdown     Exit TempleShell");
-            let _ = writeln!(term, "  ws <target>  Switch workspace (sway IPC)");
-	            let _ = writeln!(
-	                term,
-	                "  tapp <cmd>   Launch a Temple app / TempleOS program"
-	            );
-	            let _ = writeln!(term, "  hc [file]    Run HolyC (alias for 'tapp hc')");
-	            let _ = writeln!(term, "  edit <path>  Open Temple editor");
-	            let _ = writeln!(term, "  files [dir]  File browser (UI)");
-	            let _ = writeln!(term, "  apps         App launcher (UI)");
-	            let _ = writeln!(term, "  menu         TempleOS menu (icons)");
-	            let _ = writeln!(term, "");
-	            let _ = writeln!(term, "Window manager:");
+            let _ = writeln!(term, "TempleShell help");
+            let _ = writeln!(term, "");
+            let _ = writeln!(term, "Usage:");
+            let _ = writeln!(term, "  help                  This screen");
+            let _ = writeln!(term, "  help <cmd>             Command help");
+            let _ = writeln!(term, "  help <topic|path>       Open docs (Temple root /Doc or ::/Doc)");
+            let _ = writeln!(term, "");
+            let _ = writeln!(term, "Examples:");
+            let _ = writeln!(term, "  help ls");
+            let _ = writeln!(term, "  help AboutTempleOS");
+            let _ = writeln!(term, "  help ::/Doc/DolDocOverview.DD");
+            let _ = writeln!(term, "");
+            let _ = writeln!(term, "Paths:");
+            let _ = writeln!(term, "  /Home/... /Doc/...      Under TEMPLE_ROOT");
+            let _ = writeln!(term, "  ::/Doc/... ::/Demo/...  TempleOS tree (TEMPLEOS_ROOT)");
+            let _ = writeln!(term, "");
+            let _ = writeln!(term, "Docs (TempleOS, if available):");
+            let _ = writeln!(
+                term,
+                "  AboutTempleOS  CmdLineOverview  AutoComplete  DolDocOverview  Tips"
+            );
+            let _ = writeln!(term, "  (type: help docs for more)");
+            let _ = writeln!(term, "");
+            let _ = writeln!(term, "Commands (type: help <cmd>):");
+            let _ = writeln!(term, "  help [cmd|topic]      Help / open docs");
+            let _ = writeln!(term, "  clear                 Clear output");
+            let _ = writeln!(term, "");
+            let _ = writeln!(term, "  Navigation:");
+            let _ = writeln!(term, "    pwd                 Print working directory");
+            let _ = writeln!(term, "    cd [path]            Change directory");
+            let _ = writeln!(term, "    ls [path]            List directory");
+            let _ = writeln!(term, "    files [dir]          File browser UI (alias: fm)");
+            let _ = writeln!(term, "    apps                 App launcher UI (alias: launcher)");
+            let _ = writeln!(term, "    menu                 TempleOS PersonalMenu (icons)");
+            let _ = writeln!(term, "");
+            let _ = writeln!(term, "  Files:");
+            let _ = writeln!(term, "    cat <path>           Print file");
+            let _ = writeln!(term, "    cp <src> <dst>       Copy file");
+            let _ = writeln!(term, "    mv <src> <dst>       Move/rename");
+            let _ = writeln!(term, "    rm <path>            Remove file (or: rm -r <dir>)");
+            let _ = writeln!(term, "    mkdir <path>         Make directory");
+            let _ = writeln!(term, "    touch <path>         Create empty file");
+            let _ = writeln!(term, "");
+            let _ = writeln!(term, "  Text:");
+            let _ = writeln!(term, "    grep <needle> <path> Search file");
+            let _ = writeln!(term, "    find [path] [s]      Find files (substring)");
+            let _ = writeln!(term, "    head [-n N] <path>   First lines");
+            let _ = writeln!(term, "    tail [-n N] <path>   Last lines");
+            let _ = writeln!(term, "    wc <path>            Count lines/words/bytes");
+            let _ = writeln!(term, "    more <path>          Pager (alias: less)");
+            let _ = writeln!(term, "");
+            let _ = writeln!(term, "  Temple apps:");
+            let _ = writeln!(term, "    tapp <cmd>           Launch a Temple app / TempleOS program");
+            let _ = writeln!(term, "    hc [file]            Run HolyC (alias for: tapp hc)");
+            let _ = writeln!(term, "    edit <path>          Temple editor");
+            let _ = writeln!(term, "");
+            let _ = writeln!(term, "  Host integration:");
+            let _ = writeln!(term, "    open <path>          Open file with xdg-open");
+            let _ = writeln!(term, "    browse <url>         Open URL with xdg-open");
+            let _ = writeln!(term, "    run <cmd> [args...]  Launch a Linux command");
+            let _ = writeln!(term, "    clip <cmd>           Host clipboard (get/set)");
+            let _ = writeln!(term, "    ws <target>          Switch workspace (sway IPC)");
+            let _ = writeln!(term, "");
+            let _ = writeln!(term, "  Misc:");
+            let _ = writeln!(term, "    env [name]           Show TempleShell vars");
+            let _ = writeln!(term, "    set <k=v>            Set TempleShell var");
+            let _ = writeln!(term, "    screenshot [path]    Save a PNG screenshot (alias: shot)");
+            let _ = writeln!(term, "    shutdown             Exit TempleShell (alias: exit)");
+            let _ = writeln!(term, "");
+            let _ = writeln!(term, "Hotkeys:");
+            let _ = writeln!(term, "  Tab completes commands and paths at the prompt");
+            let _ = writeln!(term, "  F2 opens the app launcher");
+            let _ = writeln!(term, "  help keymap            Key bindings overview");
+            let _ = writeln!(term, "");
+            let _ = writeln!(term, "Window manager:");
             let _ = writeln!(term, "  Click window to focus; drag title to move");
             let _ = writeln!(term, "  Ctrl+W closes focused; Alt+Tab cycles focus");
-	            let _ = writeln!(term, "");
-	            let _ = writeln!(term, "Hotkeys:");
-	            let _ = writeln!(term, "  F2 opens the app launcher");
+            let _ = writeln!(term, "");
+            let _ = writeln!(term, "Environment:");
+            let _ = writeln!(term, "  TEMPLE_ROOT            Temple user data root (default: ~/.templelinux)");
+            let _ = writeln!(term, "  TEMPLEOS_ROOT          TempleOS source tree (optional)");
+            let _ = writeln!(term, "  TEMPLE_SOCK            IPC socket path (optional)");
+            let _ = writeln!(term, "  TEMPLE_WS_TEMPLE=1     Sway workspace number");
+            let _ = writeln!(term, "  TEMPLE_WS_LINUX=2      Sway workspace number");
+            let _ = writeln!(term, "  TEMPLE_AUTO_LINUX_WS=1 Auto-switch on open/browse/run");
             return;
         }
 
-        if let Some(topic) = args.first().copied() {
+        let topic = args[0];
+
+        if topic.eq_ignore_ascii_case("keymap") || topic.eq_ignore_ascii_case("keys") {
+            self.open_keymap_doc(term);
+            return;
+        }
+        if topic.eq_ignore_ascii_case("docs") {
+            let _ = writeln!(term, "Docs (TempleOS):");
+            let _ = writeln!(term, "  help AboutTempleOS");
+            let _ = writeln!(term, "  help CmdLineOverview");
+            let _ = writeln!(term, "  help AutoComplete");
+            let _ = writeln!(term, "  help DolDocOverview");
+            let _ = writeln!(term, "  help Tips");
+            let _ = writeln!(term, "");
+            let _ = writeln!(term, "Docs paths:");
+            let _ = writeln!(term, "  help ::/Doc/<name>.DD");
+            let _ = writeln!(term, "  help /Doc/<name> (Temple root)");
+            return;
+        }
+
+        let is_cmd = SHELL_COMMANDS.iter().any(|&cmd| cmd == topic);
+        if !is_cmd {
             if self.try_show_doc(topic, term) {
                 return;
             }
+            let _ = writeln!(term, "No help for: {topic}");
+            let _ = writeln!(term, "Try: help (commands), help docs, help keymap");
+            return;
         }
 
-        match args[0] {
+        match topic {
             "help" => {
                 let _ = writeln!(term, "help [cmd]");
+                let _ = writeln!(term, "help <topic|path>");
+                let _ = writeln!(term, "examples:");
+                let _ = writeln!(term, "  help ls");
+                let _ = writeln!(term, "  help AboutTempleOS");
+                let _ = writeln!(term, "  help ::/Doc/DolDocOverview.DD");
             }
             "clear" => {
                 let _ = writeln!(term, "clear");
@@ -2047,6 +2118,53 @@ impl Shell {
                 let _ = writeln!(term, "No help for: {other}");
             }
         }
+    }
+
+    fn open_keymap_doc(&mut self, term: &mut Terminal) {
+        const KEYMAP_TDOC: &str = r#"# Key bindings (TempleLinux)
+
+## Shell prompt
+- `Enter` submit command
+- `Tab` complete commands/paths
+- `Up`/`Down` history
+- `Left`/`Right` move cursor
+- `Home`/`End` line start/end
+- `Backspace`/`Delete` delete char
+
+## File browser (`files` / `apps`)
+- `Tab` switch Files/Apps
+- `Up`/`Down` move selection
+- `PgUp`/`PgDn` page up/down
+- `Home`/`End` jump top/bottom
+- `Enter` open / launch
+- `Backspace` up dir (Files tab)
+- `Esc` back
+
+## Doc viewer
+- `Esc` back
+- `Up`/`Down` scroll
+- `PgUp`/`PgDn` page up/down
+- `Home`/`End` jump top/bottom
+- `Tab` next link
+- `Enter` open link
+
+## Window manager
+- Click window to focus; drag title to move
+- `Ctrl+W` close focused window
+- `Alt+Tab` cycle focus
+- `F2` open app launcher
+"#;
+
+        let bins: std::collections::BTreeMap<u32, Vec<u8>> = std::collections::BTreeMap::new();
+        self.open_doc_viewer(
+            "TempleLinux:KeyMap".to_string(),
+            DocKind::TempleDoc,
+            KEYMAP_TDOC,
+            bins,
+            false,
+            None,
+            term,
+        );
     }
 
     fn cmd_files(&mut self, args: &[&str], term: &mut Terminal) {
