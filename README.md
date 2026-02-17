@@ -203,6 +203,12 @@ The dedicated session is currently implemented as a generated `sway` config:
 - Arch: `sudo pacman -R templelinux-git`
 - Debian/Ubuntu: `sudo apt remove templelinux templelinux-templeos-data`
 
+### Troubleshooting
+
+- “TempleOS tree not found”: ensure the submodule is checked out (`git submodule update --init --recursive`), install the `templelinux-templeos-data` package, or set `TEMPLEOS_ROOT` explicitly.
+- Graphics/Vulkan issues: ensure your Vulkan driver stack is installed; if Vulkan is broken on your system, try forcing OpenGL: `WGPU_BACKEND=gl templeshell`.
+- Dedicated session doesn’t start: `templelinux-session` requires `sway` to be installed and in `PATH`.
+
 ## Smoke tests
 
 - Protocol-level: `cargo test -q`
