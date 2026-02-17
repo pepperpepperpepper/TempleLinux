@@ -1258,9 +1258,149 @@ Progress notes (2026-02-08):
 - Made `temple-hc` treat “sync present” disconnects as a graceful `Broken pipe` exit (avoids noisy errors when TempleShell intentionally exits early after dumping PNGs).
 - Latest uploaded gallery: `https://tmp.uh-oh.wtf/templelinux/screenshots/2026/02/08/072528-1791502/index.html`
 
+### Milestone 39: Distribution packages (Arch + Ubuntu)
+Status (2026-02-17): Planned (priority; “install on top of” existing distros)
+
+Goal:
+- Make TempleLinux installable as a normal user-space package on common distros (no custom ISO required).
+
+Acceptance:
+- Arch Linux:
+  - Provide an AUR `templelinux-git` (or similar) package that installs:
+    - `templeshell`, `temple-hc`, `temple-edit`, `temple-paint`, `temple-demo` to `/usr/bin/`.
+    - `templelinux-session` to `/usr/bin/` (or `/usr/lib/templelinux/` + a small `/usr/bin/` wrapper).
+    - `packaging/wayland-sessions/templelinux.desktop` to `/usr/share/wayland-sessions/`.
+    - The TempleOS source/assets tree to `/usr/share/templelinux/TempleOS/` so `TEMPLEOS_ROOT` auto-discovery works out of the box.
+  - Document required deps + optional deps (sway session, XWayland, test tooling).
+- Ubuntu/Debian:
+  - Provide a `.deb` (either via `cargo-deb` or `debian/` packaging) that installs the same filesystem layout.
+  - Ensure runtime deps are accurate (Wayland/X11 libs, GL/EGL/Vulkan stack, ALSA, `xdg-open`, etc).
+- Post-install workflow:
+  - `templeshell` runs from an existing desktop session without needing `cargo`.
+  - The login manager shows “TempleLinux” as a Wayland session (via `/usr/share/wayland-sessions/templelinux.desktop`).
+  - `templelinux-session` starts the compositor (initially `sway`) + fullscreen `templeshell` reliably.
+  - `TEMPLEOS_ROOT` discovery works when installed system-wide (default should be `/usr/share/templelinux/TempleOS`).
+
+Notes / constraints:
+- If bundling TempleOS sources/assets in binary packages is undesirable or legally constrained, split packaging into:
+  - `templelinux` (binaries + scripts + session files), and
+  - `templelinux-templeos-data` (TempleOS tree),
+  - or add an explicit first-run “download TempleOS tree” step (with user consent) and cache it under `/usr/share/templelinux/` or `~/.templelinux/`.
+
 ---
 
 ## 11) Practical build & packaging notes (Linux)
+
+### System-wide install layout (for distro packages)
+
+For a real “install on top of Arch/Ubuntu” experience, packages should install:
+
+- `/usr/bin/templeshell` (+ other `temple-*` bins)
+- `/usr/bin/templelinux-session` (starts the compositor + TempleShell on workspace 1)
+- `/usr/share/wayland-sessions/templelinux.desktop` (so GDM/SDDM can offer a “TempleLinux” session)
+- `/usr/share/templelinux/TempleOS/` (TempleOS sources/assets; enables automatic `TEMPLEOS_ROOT` discovery)
+
+Per-user writable state stays under `~/.templelinux/` (created on first run).
+
+### Specification: TempleLinux Startup and Session Management (v1.0)
+
+Status: Intended behavior (source-of-truth for startup/session UX; implement incrementally).
+
+Component scope:
+- `templeshell` (core binary)
+- `packaging/bin/templelinux-session` (integration script / session launcher)
+
+#### 1) Overview
+
+TempleLinux supports two launch modes:
+
+1) **Standard Application Mode (default)**: `templeshell` runs as a graphical client inside an existing desktop session (GNOME/KDE/i3/etc).
+2) **Dedicated Session Mode (sway)**: `templelinux-session` starts a specialized Wayland session where `templeshell` “owns” workspace 1 and Linux apps live on workspace 2.
+
+#### 2) Environment & asset discovery phase (must run before graphics init)
+
+##### 2.1 Root directory initialization
+
+- Read `TEMPLE_ROOT`.
+- Default: `$HOME/.templelinux` when unset.
+- Ensure the directory exists and contains (create if missing):
+  - `Home/` (user files)
+  - `Doc/` (documentation overlays)
+  - `Cfg/` (configuration, history, variables)
+  - `Apps/` (local HolyC apps)
+
+##### 2.2 Upstream TempleOS discovery
+
+- Read `TEMPLEOS_ROOT`.
+- If unset: traverse parents searching for `third_party/TempleOS/Kernel/FontStd.HC`.
+- System fallback: `/usr/share/templelinux/TempleOS`.
+- Fail fast: if the TempleOS tree cannot be found/validated (at minimum `Kernel/FontStd.HC` and `Adam/Gr/GrPalette.HC`), abort immediately with a clear error explaining how to fix it (submodule missing vs. env var).
+
+#### 3) Standard Application Mode (windowed/fullscreen)
+
+- Window creation:
+  - Use `winit` to create a surface; select Wayland/X11 automatically.
+  - Default to fullscreen (overrideable via `--no-fullscreen`).
+  - Internal resolution is fixed at `640×480`; output resolution matches the current monitor/window.
+- Scaling strategy:
+  - Nearest-neighbor (`wgpu` sampler: `Nearest`).
+  - Maintain 4:3 aspect ratio; letterbox with black bars when needed.
+- Input focus:
+  - On focus loss: enter a “paused” state (ignore input; throttle rendering).
+  - On focus regain: flush queued input and restore the prior state.
+
+#### 4) Dedicated Session Mode (sway integration)
+
+- `templelinux-session` must generate a sway config that:
+  - Defines workspace 1 (`"1:Temple"`) for `templeshell`:
+    - assigns `templeshell` to it,
+    - forces fullscreen,
+    - hides bars/overlays on that workspace for a clean slate.
+  - Defines workspace 2 (`"2:Linux"`) as the default destination for non-Temple windows.
+- Launch behavior:
+  1) User runs `templelinux-session` (from TTY or a display manager session entry).
+  2) Script starts `sway` with the generated config.
+  3) `templeshell` starts on workspace 1.
+- Workspace bridging:
+  - Host integration commands (`browse`, `open`, `run`) in TempleShell should switch to workspace 2 (via `swaymsg`) before spawning the external Linux process, so the user sees the launched app immediately.
+  - Users return to workspace 1 manually (or via hotkey like `Super+1`).
+
+#### 5) Runtime initialization sequence (after graphics init)
+
+1) IPC server setup: bind Unix socket at `TEMPLE_SOCK`.
+   - Default socket path: `$XDG_RUNTIME_DIR/temple.sock` or `$TEMPLE_ROOT/temple.sock` if runtime dir is unavailable.
+2) Start async listener thread for clients (`temple-hc`, `temple-edit`, etc.).
+3) AutoRun: if `$TEMPLE_ROOT/Cfg/AutoStart.tl` exists, execute commands line-by-line.
+4) Initial render: draw prompt background and command line.
+5) Enter the `winit` event loop (60 FPS target; throttle when idle/paused).
+
+#### 6) Graceful shutdown
+
+##### 6.1 User-initiated
+
+- Triggers: shell command `exit`/`bye`, or compositor window close.
+- Behavior:
+  - Send `MSG_SHUTDOWN` to all connected IPC clients.
+  - Wait up to ~100ms for clients to acknowledge/disconnect.
+  - Persist shell history and variables.
+  - Remove the IPC socket file.
+  - Exit with code `0`.
+
+##### 6.2 Crash / signal handling
+
+- Triggers: `SIGTERM`, `SIGINT`, or panic.
+- Behavior:
+  - Close window and IPC socket promptly.
+  - Best-effort logging to `stderr` or `$TEMPLE_ROOT/Cfg/CrashLog.txt`.
+
+#### 7) Launch arguments
+
+| Argument | Type | Description |
+| :--- | :--- | :--- |
+| `--no-fullscreen` | Flag | Override default; start in a resizable window (640×480 minimum) |
+| `--config <path>` | Path | Explicitly set `TEMPLE_ROOT` |
+| `--os-root <path>` | Path | Explicitly set `TEMPLEOS_ROOT` |
+| `--sock <path>` | Path | Explicitly set IPC socket path |
 
 ### Session startup (typical)
 

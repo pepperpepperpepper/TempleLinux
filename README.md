@@ -10,6 +10,21 @@ If you cloned without submodules, run:
 git submodule update --init --recursive
 ```
 
+## Overview (from `analysis.md`)
+
+TempleLinux is a Linux-native software stack that tries to recreate the **TempleOS “feel”** without running the TempleOS kernel:
+
+- **`templeshell`** is a graphical host shell that renders into a fixed internal framebuffer (currently **640×480**) and scales it with **nearest-neighbor** + **4:3 letterboxing** for pixel fidelity.
+- **`temple-hc`** runs TempleOS programs from their **HolyC source**, backed by a practical TempleOS API compatibility layer (graphics/input/files/docs/etc).
+- Linux remains “real” underneath: normal Linux apps are launched normally (e.g. via `xdg-open`) and can live on a separate workspace in the dedicated session mode.
+
+What it is *not*:
+
+- Not the TempleOS kernel or a VM/emulator image.
+- Not binary compatibility for TempleOS ISOs/binaries.
+
+More detail: `analysis.md` and `research.md`.
+
 ## Screenshots
 
 <p>
