@@ -252,8 +252,9 @@ demo_png="${out_dir}/netofdots.png"
 pulldown_demo="::/Demo/PullDownMenu.HC"
 edit_png="${out_dir}/editor.png"
 edit_err_png="${out_dir}/editor-error-jump.png"
-edit_file="${out_dir}/editor-sample.txt"
-edit_err_file="${out_dir}/editor-error-sample.HC"
+edit_tmp_dir="$(mktemp -d -t templelinux-edit-samples-XXXXXXXX)"
+edit_file="${edit_tmp_dir}/editor-sample.txt"
+edit_err_file="${edit_tmp_dir}/editor-error-sample.HC"
 
 runtime_dir="${XDG_RUNTIME_DIR:-/tmp}"
 uniq="$(date +%s%N)-$$"
@@ -274,6 +275,7 @@ cleanup() {
   if [[ -n "${sock_pulldown}" ]]; then
     rm -f "${sock_pulldown}" 2>/dev/null || true
   fi
+  rm -rf "${edit_tmp_dir}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
