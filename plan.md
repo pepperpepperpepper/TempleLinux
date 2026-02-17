@@ -1258,6 +1258,13 @@ Progress notes (2026-02-08):
 - Made `temple-hc` treat “sync present” disconnects as a graceful `Broken pipe` exit (avoids noisy errors when TempleShell intentionally exits early after dumping PNGs).
 - Latest uploaded gallery: `https://tmp.uh-oh.wtf/templelinux/screenshots/2026/02/08/072528-1791502/index.html`
 
+Progress notes (2026-02-17):
+- Ran a full GUI smoke + screenshot gallery capture via `packaging/bin/templelinux-publish-screenshots`:
+  - Latest uploaded gallery: `https://tmp.uh-oh.wtf/templelinux/screenshots/2026/02/17/120110-4137273/index.html`
+  - Committed the captured PNGs + `index.html` under `docs/screenshots/2026-02-17/` and updated `README.md` to reference them.
+- Tweaked the screenshot publisher so editor sample files are created in a temp dir (keeps `docs/screenshots/.../` clean).
+- Uploaded `research.md` to Open WebUI via `chat-uh-oh-from-file`: `https://chat.uh-oh.wtf/c/578f7929-e2d0-49e2-a415-d561670923d3`
+
 ### Milestone 39: Distribution packages (Arch + Ubuntu)
 Status (2026-02-17): Completed (priority; “install on top of” existing distros)
 

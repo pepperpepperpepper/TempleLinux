@@ -89,16 +89,16 @@ More detail: `research.md`, `plan.md`, and `COMPATIBILITY.md`.
 ## Screenshots
 
 <p>
-  <img src="docs/screenshots/2026-02-15/personalmenu.png" width="320" alt="PersonalMenu icons">
-  <img src="docs/screenshots/2026-02-15/doldoc-helpindex.png" width="320" alt="DolDoc HelpIndex">
+  <img src="docs/screenshots/2026-02-17/personalmenu.png" width="320" alt="PersonalMenu icons">
+  <img src="docs/screenshots/2026-02-17/doldoc-helpindex.png" width="320" alt="DolDoc HelpIndex">
 </p>
 
 <p>
-  <img src="docs/screenshots/2026-02-15/multiwindow.png" width="320" alt="Multi-window (Paint + Demo)">
-  <img src="docs/screenshots/2026-02-15/wallpaperfish.png" width="320" alt="WallpaperFish background">
+  <img src="docs/screenshots/2026-02-17/multiwindow.png" width="320" alt="Multi-window (Paint + Demo)">
+  <img src="docs/screenshots/2026-02-17/wallpaperfish.png" width="320" alt="WallpaperFish background">
 </p>
 
-More screenshots: `docs/screenshots/2026-02-15/`
+More screenshots: `docs/screenshots/2026-02-17/`
 
 ## Install (experimental)
 
