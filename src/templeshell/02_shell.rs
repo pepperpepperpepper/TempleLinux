@@ -1595,9 +1595,6 @@ impl Shell {
             .unwrap_or(self.input.len());
 
         let prefix = self.input[token_start..cursor].to_string();
-        if prefix.is_empty() {
-            return false;
-        }
 
         let is_first_token = self.input[..token_start].trim().is_empty();
         if is_first_token {
