@@ -13,7 +13,7 @@ cd "${repo_root}"
 
 arch="$(dpkg --print-architecture)"
 short_sha="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-crate_ver="$(grep -m1 '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*version[[:space:]]*=[[:space:]]*\"([^\"]+)\".*/\\1/' || true)"
+crate_ver="$(grep -m1 '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*version[[:space:]]*=[[:space:]]*\"([^\"]+)\".*/\1/' || true)"
 crate_ver="${crate_ver:-0.0.0}"
 version="${crate_ver}+git${short_sha}"
 
