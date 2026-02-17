@@ -1,10 +1,11 @@
 pkgname=templelinux-git
-pkgver=r3.98b3a6a
+pkgver=r6.d6b0609
 pkgrel=1
 pkgdesc='TempleOS-inspired environment on Linux (TempleShell + HolyC runtime)'
 arch=('x86_64')
 url='https://github.com/pepperpepperpepper/TempleLinux'
 license=('custom')
+options=('!debug')
 
 depends=(
   'alsa-lib'
@@ -43,6 +44,7 @@ prepare() {
 
 build() {
   cd "$srcdir/TempleLinux"
+  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${srcdir}=/usr/src/debug/${pkgname}"
   cargo build --release --locked
 }
 

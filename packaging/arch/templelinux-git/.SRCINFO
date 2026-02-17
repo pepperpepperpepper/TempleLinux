@@ -1,6 +1,6 @@
 pkgbase = templelinux-git
 	pkgdesc = TempleOS-inspired environment on Linux (TempleShell + HolyC runtime)
-	pkgver = r3.98b3a6a
+	pkgver = r6.d6b0609
 	pkgrel = 1
 	url = https://github.com/pepperpepperpepper/TempleLinux
 	arch = x86_64
@@ -20,6 +20,7 @@ pkgbase = templelinux-git
 	optdepends = xorg-xwayland: run X11 apps in the dedicated session
 	provides = templelinux
 	conflicts = templelinux
+	options = !debug
 	source = git+https://github.com/pepperpepperpepper/TempleLinux.git
 	sha256sums = SKIP
 
