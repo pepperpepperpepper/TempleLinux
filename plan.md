@@ -1297,6 +1297,7 @@ Progress notes (2026-02-17):
 - Expanded `README.md` install instructions (from-source, Arch, Debian/Ubuntu, sway session, uninstall).
 - Tweaked the Arch `PKGBUILD` to disable debug subpackages (`options=('!debug')`) since the TempleOS tree includes non-debug binaries and makes `makepkg` emit noisy `gdb-add-index` errors.
 - Fixed `packaging/debian/build-debs.sh` version parsing and validated `.deb` builds in an Ubuntu 24.04 Docker container (artifacts in `packaging/debian/dist/`).
+- Tweaked Debian runtime deps to prefer real ALSA (`libasound2t64 | libasound2`) so `apt install` won’t accidentally satisfy `libasound2` via OSS shim packages that break audio symbol resolution.
 
 ---
 
