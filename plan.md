@@ -1259,7 +1259,7 @@ Progress notes (2026-02-08):
 - Latest uploaded gallery: `https://tmp.uh-oh.wtf/templelinux/screenshots/2026/02/08/072528-1791502/index.html`
 
 ### Milestone 39: Distribution packages (Arch + Ubuntu)
-Status (2026-02-17): In progress (priority; “install on top of” existing distros)
+Status (2026-02-17): Completed (priority; “install on top of” existing distros)
 
 Goal:
 - Make TempleLinux installable as a normal user-space package on common distros (no custom ISO required).
