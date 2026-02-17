@@ -1,0 +1,65 @@
+pkgname=templelinux-git
+pkgver=r3.98b3a6a
+pkgrel=1
+pkgdesc='TempleOS-inspired environment on Linux (TempleShell + HolyC runtime)'
+arch=('x86_64')
+url='https://github.com/pepperpepperpepper/TempleLinux'
+license=('custom')
+
+depends=(
+  'alsa-lib'
+  'libx11'
+  'libxcb'
+  'libxkbcommon'
+  'vulkan-icd-loader'
+  'wayland'
+  'xdg-utils'
+)
+makedepends=(
+  'cargo'
+  'git'
+  'pkgconf'
+  'rust'
+)
+optdepends=(
+  'sway: dedicated TempleLinux session (workspace 1 Temple, workspace 2 Linux)'
+  'xorg-xwayland: run X11 apps in the dedicated session'
+)
+provides=('templelinux')
+conflicts=('templelinux')
+
+source=("git+${url}.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$srcdir/TempleLinux"
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd "$srcdir/TempleLinux"
+  git submodule update --init --recursive
+}
+
+build() {
+  cd "$srcdir/TempleLinux"
+  cargo build --release --locked
+}
+
+package() {
+  cd "$srcdir/TempleLinux"
+
+  install -Dm755 "target/release/templeshell" "$pkgdir/usr/bin/templeshell"
+  install -Dm755 "target/release/temple-demo" "$pkgdir/usr/bin/temple-demo"
+  install -Dm755 "target/release/temple-hc" "$pkgdir/usr/bin/temple-hc"
+  install -Dm755 "target/release/temple-paint" "$pkgdir/usr/bin/temple-paint"
+  install -Dm755 "target/release/temple-edit" "$pkgdir/usr/bin/temple-edit"
+
+  install -Dm755 "packaging/bin/templelinux-session" "$pkgdir/usr/bin/templelinux-session"
+  install -Dm644 "packaging/wayland-sessions/templelinux.desktop" \
+    "$pkgdir/usr/share/wayland-sessions/templelinux.desktop"
+
+  install -d "$pkgdir/usr/share/templelinux/TempleOS"
+  tar --exclude=.git -C "third_party/TempleOS" -cf - . \
+    | tar -C "$pkgdir/usr/share/templelinux/TempleOS" -xf -
+}

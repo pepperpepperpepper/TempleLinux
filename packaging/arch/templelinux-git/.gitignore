@@ -1,0 +1,5 @@
+/src/
+/pkg/
+/TempleLinux/
+/*.pkg.tar.*
+/*.log

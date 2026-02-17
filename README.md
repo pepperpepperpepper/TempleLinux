@@ -100,6 +100,40 @@ More detail: `research.md`, `plan.md`, and `COMPATIBILITY.md`.
 
 More screenshots: `docs/screenshots/2026-02-15/`
 
+## Install (experimental)
+
+TempleLinux can be installed “on top of” an existing Linux distro (no custom ISO required). Packaging is still evolving, but the repo includes working packaging scaffolding under `packaging/`.
+
+### Arch Linux (AUR-style `PKGBUILD`)
+
+An AUR-style VCS package lives at `packaging/arch/templelinux-git/`.
+
+```bash
+cd packaging/arch/templelinux-git
+makepkg -si
+```
+
+This installs:
+
+- TempleLinux binaries (`templeshell`, `temple-hc`, etc.) to `/usr/bin/`
+- `templelinux-session` to `/usr/bin/`
+- Wayland session entry to `/usr/share/wayland-sessions/templelinux.desktop`
+- TempleOS sources/assets to `/usr/share/templelinux/TempleOS`
+
+### Debian/Ubuntu (`.deb`)
+
+Deb packaging scripts live in `packaging/debian/` and build **two** packages:
+
+- `templelinux` (binaries + session integration)
+- `templelinux-templeos-data` (TempleOS sources/assets under `/usr/share/templelinux/TempleOS`)
+
+On Ubuntu/Debian:
+
+```bash
+./packaging/debian/build-debs.sh
+sudo apt install ./packaging/debian/dist/templelinux_*.deb ./packaging/debian/dist/templelinux-templeos-data_*.deb
+```
+
 ## Smoke tests
 
 - Protocol-level: `cargo test -q`

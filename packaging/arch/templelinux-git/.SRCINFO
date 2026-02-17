@@ -1,0 +1,26 @@
+pkgbase = templelinux-git
+	pkgdesc = TempleOS-inspired environment on Linux (TempleShell + HolyC runtime)
+	pkgver = r3.98b3a6a
+	pkgrel = 1
+	url = https://github.com/pepperpepperpepper/TempleLinux
+	arch = x86_64
+	license = custom
+	makedepends = cargo
+	makedepends = git
+	makedepends = pkgconf
+	makedepends = rust
+	depends = alsa-lib
+	depends = libx11
+	depends = libxcb
+	depends = libxkbcommon
+	depends = vulkan-icd-loader
+	depends = wayland
+	depends = xdg-utils
+	optdepends = sway: dedicated TempleLinux session (workspace 1 Temple, workspace 2 Linux)
+	optdepends = xorg-xwayland: run X11 apps in the dedicated session
+	provides = templelinux
+	conflicts = templelinux
+	source = git+https://github.com/pepperpepperpepper/TempleLinux.git
+	sha256sums = SKIP
+
+pkgname = templelinux-git

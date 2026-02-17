@@ -1259,7 +1259,7 @@ Progress notes (2026-02-08):
 - Latest uploaded gallery: `https://tmp.uh-oh.wtf/templelinux/screenshots/2026/02/08/072528-1791502/index.html`
 
 ### Milestone 39: Distribution packages (Arch + Ubuntu)
-Status (2026-02-17): Planned (priority; “install on top of” existing distros)
+Status (2026-02-17): In progress (priority; “install on top of” existing distros)
 
 Goal:
 - Make TempleLinux installable as a normal user-space package on common distros (no custom ISO required).
@@ -1286,6 +1286,14 @@ Notes / constraints:
   - `templelinux` (binaries + scripts + session files), and
   - `templelinux-templeos-data` (TempleOS tree),
   - or add an explicit first-run “download TempleOS tree” step (with user consent) and cache it under `/usr/share/templelinux/` or `~/.templelinux/`.
+
+Progress notes (2026-02-17):
+- Added Arch AUR packaging skeleton under `packaging/arch/templelinux-git/`:
+  - `PKGBUILD` installs TempleLinux binaries, `templelinux-session`, and the Wayland session entry.
+  - Installs the vendored TempleOS tree to `/usr/share/templelinux/TempleOS` for out-of-the-box `TEMPLEOS_ROOT` discovery.
+- Added Debian/Ubuntu packaging scripts under `packaging/debian/`:
+  - `build-debs.sh` builds two packages: `templelinux` and `templelinux-templeos-data`.
+  - Includes `.gitignore` so local build artifacts don’t pollute the repo.
 
 ---
 
