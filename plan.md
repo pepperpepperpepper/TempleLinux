@@ -1294,6 +1294,7 @@ Progress notes (2026-02-17):
 - Added Debian/Ubuntu packaging scripts under `packaging/debian/`:
   - `build-debs.sh` builds two packages: `templelinux` and `templelinux-templeos-data`.
   - Includes `.gitignore` so local build artifacts don’t pollute the repo.
+- Expanded `README.md` install instructions (from-source, Arch, Debian/Ubuntu, sway session, uninstall).
 
 ---
 

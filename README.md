@@ -102,13 +102,54 @@ More screenshots: `docs/screenshots/2026-02-15/`
 
 ## Install (experimental)
 
-TempleLinux can be installed “on top of” an existing Linux distro (no custom ISO required). Packaging is still evolving, but the repo includes working packaging scaffolding under `packaging/`.
+TempleLinux can be installed “on top of” an existing Linux distro (no custom ISO required).
+
+There are two main ways to use it:
+
+- **Run from a repo checkout** (best for development).
+- **Install system-wide** using the packaging scaffolding under `packaging/` (best for “normal app” usage).
+
+### Requirements (high level)
+
+- A working graphics stack (Wayland or X11) with a Vulkan/OpenGL driver that works with `wgpu`.
+- The upstream **TempleOS source/assets tree** must be available, either:
+  - via the git submodule (`third_party/TempleOS/`), or
+  - via a system install at `/usr/share/templelinux/TempleOS` (what the distro packages install).
+- Optional (for the dedicated session): `sway` (+ `xwayland` if you want X11 apps in the “Linux” workspace).
+
+### Option A: Run from source (any distro)
+
+1) Clone with submodules:
+
+```bash
+git clone --recurse-submodules https://github.com/pepperpepperpepper/TempleLinux.git
+cd TempleLinux
+```
+
+2) Build:
+
+```bash
+cargo build --release --locked
+```
+
+3) Run TempleShell from your current desktop session:
+
+```bash
+./target/release/templeshell
+```
+
+If you see errors about missing TempleOS files, ensure the submodule is present:
+
+```bash
+git submodule update --init --recursive
+```
 
 ### Arch Linux (AUR-style `PKGBUILD`)
 
 An AUR-style VCS package lives at `packaging/arch/templelinux-git/`.
 
 ```bash
+sudo pacman -S --needed base-devel git
 cd packaging/arch/templelinux-git
 makepkg -si
 ```
@@ -130,9 +171,37 @@ Deb packaging scripts live in `packaging/debian/` and build **two** packages:
 On Ubuntu/Debian:
 
 ```bash
+sudo apt update
+sudo apt install -y \
+  dpkg-dev build-essential pkg-config git curl ca-certificates \
+  libasound2-dev libx11-dev libxcb1-dev libwayland-dev libxkbcommon-dev \
+  libvulkan-dev
+
+# Install Rust (if you don't already have `cargo`):
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
 ./packaging/debian/build-debs.sh
 sudo apt install ./packaging/debian/dist/templelinux_*.deb ./packaging/debian/dist/templelinux-templeos-data_*.deb
 ```
+
+### Dedicated session mode (Sway)
+
+If you installed the packages above (or you have `templeshell` in `PATH`), you can start the dedicated session:
+
+- From a **display manager** (GDM/SDDM): log out, then pick the **“TempleLinux”** Wayland session.
+- From a **TTY**: run `templelinux-session`.
+
+The dedicated session is currently implemented as a generated `sway` config:
+
+- Workspace **1**: `templeshell` (fullscreen)
+- Workspace **2**: Linux apps
+- Hotkeys: `Super+1` (Temple), `Super+2` (Linux), `Super+Shift+E` (exit sway)
+
+### Uninstall
+
+- Arch: `sudo pacman -R templelinux-git`
+- Debian/Ubuntu: `sudo apt remove templelinux templelinux-templeos-data`
 
 ## Smoke tests
 
