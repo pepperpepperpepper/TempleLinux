@@ -45,6 +45,78 @@ impl Vm {
             .collect()
     }
 
+    pub(super) fn linux_file_allowlist(&self) -> Vec<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+
+        if let Ok(v) = std::env::var("TEMPLE_LINUX_FILE_ALLOW") {
+            let v = v.trim();
+            if !v.is_empty() {
+                let mut out: Vec<PathBuf> = Vec::new();
+                for entry in v.split(|ch| ch == ':' || ch == ',') {
+                    let entry = entry.trim();
+                    if entry.is_empty() {
+                        continue;
+                    }
+                    if matches!(entry, "*" | "any" | "all") {
+                        return vec![PathBuf::from("/")];
+                    }
+
+                    let path = Self::expand_tilde_or_home_relative(entry, home.as_deref());
+                    out.push(Self::normalize_host_path_lexical(&path));
+                }
+                if !out.is_empty() {
+                    return out;
+                }
+            }
+        }
+
+        if let Ok(root) = std::env::var("TEMPLE_ROOT") {
+            let path = PathBuf::from(root).join("Cfg/LinuxFileAllow.txt");
+            if let Ok(text) = std::fs::read_to_string(path) {
+                let mut out: Vec<PathBuf> = Vec::new();
+                for line in text.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if matches!(line, "*" | "any" | "all") {
+                        return vec![PathBuf::from("/")];
+                    }
+                    let path = Self::expand_tilde_or_home_relative(line, home.as_deref());
+                    out.push(Self::normalize_host_path_lexical(&path));
+                }
+                if !out.is_empty() {
+                    return out;
+                }
+            }
+        }
+
+        if let Some(home) = home {
+            vec![Self::normalize_host_path_lexical(&home)]
+        } else {
+            vec![PathBuf::from("/")]
+        }
+    }
+
+    pub(super) fn bridge_helper_candidates(&self) -> Vec<PathBuf> {
+        if let Ok(v) = std::env::var("TEMPLE_BRIDGE_HELPER") {
+            let v = v.trim();
+            if !v.is_empty() {
+                return vec![PathBuf::from(v)];
+            }
+        }
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            let candidate = exe.with_file_name("temple-bridge-helper");
+            if candidate.exists() {
+                out.push(candidate);
+            }
+        }
+        out.push(PathBuf::from("temple-bridge-helper"));
+        out
+    }
+
     fn env_u32(&self, name: &str, default: u32) -> u32 {
         std::env::var(name)
             .ok()
@@ -57,6 +129,91 @@ impl Vm {
             return false;
         };
         matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    }
+
+    fn expand_tilde_or_home_relative(target: &str, home: Option<&Path>) -> PathBuf {
+        let target = target.trim();
+        if let Some(home) = home {
+            if target == "~" {
+                return home.to_path_buf();
+            }
+            if let Some(rest) = target.strip_prefix("~/") {
+                return home.join(rest);
+            }
+        }
+        let path = PathBuf::from(target);
+        if path.is_absolute() {
+            return path;
+        }
+        match home {
+            Some(home) => home.join(path),
+            None => std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(path),
+        }
+    }
+
+    fn normalize_host_path_lexical(path: &Path) -> PathBuf {
+        use std::path::Component;
+
+        let mut absolute = false;
+        let mut parts: Vec<std::ffi::OsString> = Vec::new();
+
+        for comp in path.components() {
+            match comp {
+                Component::Prefix(prefix) => {
+                    // Unlikely on Linux; keep a best-effort stable representation.
+                    absolute = true;
+                    parts.clear();
+                    parts.push(prefix.as_os_str().to_os_string());
+                }
+                Component::RootDir => {
+                    absolute = true;
+                }
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    let _ = parts.pop();
+                }
+                Component::Normal(s) => parts.push(s.to_os_string()),
+            }
+        }
+
+        let mut out = PathBuf::new();
+        if absolute {
+            out.push(Path::new("/"));
+        }
+        for part in parts {
+            out.push(part);
+        }
+        if out.as_os_str().is_empty() && absolute {
+            PathBuf::from("/")
+        } else {
+            out
+        }
+    }
+
+    pub(super) fn resolve_linux_host_path(&self, target: &str) -> Result<PathBuf, String> {
+        let target = target.trim();
+        if target.is_empty() {
+            return Err("host path is empty".to_string());
+        }
+
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let raw = Self::expand_tilde_or_home_relative(target, home.as_deref());
+        let path = Self::normalize_host_path_lexical(&raw);
+
+        let allow = self.linux_file_allowlist();
+        if allow
+            .iter()
+            .any(|root| root == Path::new("/") || path.starts_with(root))
+        {
+            return Ok(path);
+        }
+
+        Err(format!(
+            "host path not allowed: {} (set TEMPLE_LINUX_FILE_ALLOW or create TEMPLE_ROOT/Cfg/LinuxFileAllow.txt; use \"*\" to allow any path)",
+            path.display()
+        ))
     }
 
     fn sway_workspace_number(&self, number: u32) -> Result<(), String> {

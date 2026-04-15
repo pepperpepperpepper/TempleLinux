@@ -3,5 +3,4 @@ Name=TempleLinux
 Comment=TempleOS-like environment on Linux (TempleShell)
 Exec=templelinux-session
 Type=Application
-DesktopNames=TempleLinux
 TryExec=templelinux-session

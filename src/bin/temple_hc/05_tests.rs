@@ -1146,7 +1146,8 @@ Main;
         bytes.push(0u8); // EOF
 
         let data_path = dir.join("Home/TimeClock/TimeFile.DATA.Z");
-        std::fs::write(&data_path, bytes).unwrap();
+        let arc = temple_rt::tosz::compress_arc_compress_buf(&bytes);
+        std::fs::write(&data_path, arc).unwrap();
 
         let entry = dir.join("timerep2.HC");
         std::fs::write(

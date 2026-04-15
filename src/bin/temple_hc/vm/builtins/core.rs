@@ -208,13 +208,25 @@ impl Vm {
                     _ => return Err("FileRead: path must be a string".to_string()),
                 };
                 let host_path = self.resolve_temple_fs_target_read(&path)?;
-                let bytes = match std::fs::read(&host_path) {
+                let mut bytes = match std::fs::read(&host_path) {
                     Ok(b) => b,
                     Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Value::Int(0)),
                     Err(err) => {
                         return Err(format!("FileRead: {}: {err}", host_path.display()));
                     }
                 };
+                if path.ends_with(".Z") || path.ends_with(".z") {
+                    match temple_rt::tosz::maybe_expand_arc_compress(&bytes) {
+                        Ok(Some(expanded)) => bytes = expanded,
+                        Ok(None) => {}
+                        Err(err) => {
+                            return Err(format!(
+                                "FileRead: {}: failed to expand .Z file: {err}",
+                                host_path.display()
+                            ));
+                        }
+                    }
+                }
                 let addr = self.heap_alloc(bytes.len() + 1, true);
                 self.heap_write_bytes(addr, &bytes)?;
                 // Ensure a trailing 0 so HolyC code that expects a terminator won't run off.
@@ -247,6 +259,15 @@ impl Vm {
                     Vec::new()
                 } else {
                     self.heap_slice(buf, size)?.to_vec()
+                };
+                let bytes = if path.ends_with(".Z") || path.ends_with(".z") {
+                    if temple_rt::tosz::parse_arc_compress_header(&bytes).is_some() {
+                        bytes
+                    } else {
+                        temple_rt::tosz::compress_arc_compress_buf(&bytes)
+                    }
+                } else {
+                    bytes
                 };
                 std::fs::write(&host_path, bytes)
                     .map_err(|err| format!("FileWrite: {}: {err}", host_path.display()))?;

@@ -3,3 +3,4 @@ pub mod protocol;
 pub mod rt;
 pub mod sprite;
 pub mod templeos;
+pub mod tosz;

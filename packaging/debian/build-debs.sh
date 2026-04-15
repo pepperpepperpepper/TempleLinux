@@ -58,7 +58,7 @@ Version: ${version}
 Section: misc
 Priority: optional
 Architecture: ${arch}
-Depends: xdg-utils, libasound2t64 | libasound2, libx11-6, libxcb1, libwayland-client0, libxkbcommon0, libvulkan1
+Depends: xdg-utils, libasound2t64 | libasound2, libwayland-client0, libwayland-egl1, libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6, libxkbcommon0, libxkbcommon-x11-0, libegl1, libvulkan1
 Recommends: sway, xwayland
 Maintainer: TempleLinux contributors
 Description: TempleOS-inspired environment on Linux (TempleShell + HolyC runtime)

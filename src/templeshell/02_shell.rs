@@ -1,3 +1,27 @@
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NotificationLevel {
+    Warn,
+    Error,
+}
+
+impl NotificationLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            NotificationLevel::Warn => "WARN",
+            NotificationLevel::Error => "ERR",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ShellNotification {
+    time_hms: String,
+    level: NotificationLevel,
+    msg: String,
+}
+
+const NOTIFICATIONS_MAX: usize = 64;
+
 struct Shell {
     root_dir: PathBuf,
     cwd: TemplePath,
@@ -7,6 +31,7 @@ struct Shell {
     history_pos: Option<usize>,
     history_draft: String,
     clipboard: HostClipboard,
+    audio: audio::Audio,
     vars: std::collections::BTreeMap<String, String>,
     tapp_connected: bool,
     tapp_child: Option<std::process::Child>,
@@ -15,8 +40,11 @@ struct Shell {
     pending_window_kinds: std::collections::VecDeque<PendingWindowKind>,
     exit_requested: bool,
     pending_screenshot: Option<(String, PathBuf)>,
+    last_error: Option<String>,
+    notifications: std::collections::VecDeque<ShellNotification>,
     browser: Option<FileBrowserState>,
     doc_viewer: Option<DocViewerState>,
+    song_playback: Option<SongPlayback>,
 }
 
 const SHELL_COMMANDS: &[&str] = &[
@@ -45,6 +73,8 @@ const SHELL_COMMANDS: &[&str] = &[
     "mkdir",
     "more",
     "mv",
+    "notifs",
+    "notify",
     "open",
     "pwd",
     "rm",
@@ -73,6 +103,17 @@ enum DocActionOutcome {
     CloseDocViewer,
 }
 
+struct SongPlayback {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SongPlayback {
+    fn request_stop(&self) {
+        self.stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[derive(Default)]
 struct DolDocMeta {
     links: Vec<DocLink>,
@@ -87,8 +128,176 @@ struct BuiltDoc {
     sprites: Vec<DocSprite>,
 }
 
+fn decode_text_prefix(buf: &[u8]) -> (String, usize) {
+    let cutoff = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let text_bytes = &buf[..cutoff];
+    let text = std::str::from_utf8(text_bytes)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|_| assets::decode_cp437_bytes(text_bytes));
+    (text, cutoff)
+}
+
+const TEXT_BUILTIN_Z_MAX_COMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
+const TEXT_BUILTIN_Z_MAX_EXPANDED_BYTES: u64 = 64 * 1024 * 1024;
+
+struct TextBuiltinBytes {
+    bytes: Vec<u8>,
+    total_len: u64,
+    truncated: bool,
+    notice: Option<String>,
+}
+
+fn read_text_builtin_bytes(
+    host: &Path,
+    target: &str,
+    max_bytes: u64,
+    z_max_compressed_bytes: u64,
+    z_max_expanded_bytes: u64,
+) -> Result<TextBuiltinBytes, String> {
+    use std::io::Read as _;
+
+    let is_z = target.ends_with(".Z") || target.ends_with(".z");
+    let meta_len = std::fs::metadata(host)
+        .map_err(|err| err.to_string())?
+        .len();
+
+    if !is_z {
+        let file = std::fs::File::open(host).map_err(|err| err.to_string())?;
+        let mut bytes = Vec::new();
+        file.take(max_bytes)
+            .read_to_end(&mut bytes)
+            .map_err(|err| err.to_string())?;
+        return Ok(TextBuiltinBytes {
+            bytes,
+            total_len: meta_len,
+            truncated: meta_len > max_bytes,
+            notice: None,
+        });
+    }
+
+    if meta_len > z_max_compressed_bytes {
+        let file = std::fs::File::open(host).map_err(|err| err.to_string())?;
+        let mut bytes = Vec::new();
+        file.take(max_bytes)
+            .read_to_end(&mut bytes)
+            .map_err(|err| err.to_string())?;
+        return Ok(TextBuiltinBytes {
+            bytes,
+            total_len: meta_len,
+            truncated: meta_len > max_bytes,
+            notice: Some(format!(
+                "[.Z not expanded: {meta_len} bytes compressed (max {z_max_compressed_bytes})]"
+            )),
+        });
+    }
+
+    let bytes = std::fs::read(host).map_err(|err| err.to_string())?;
+    if let Some(hdr) = temple_rt::tosz::parse_arc_compress_header(&bytes) {
+        if hdr.expanded_size > z_max_expanded_bytes {
+            return Err(format!(
+                ".Z expands to {} bytes (max {z_max_expanded_bytes})",
+                hdr.expanded_size
+            ));
+        }
+        let mut expanded =
+            temple_rt::tosz::expand_arc_compress(&bytes).map_err(|err| err.to_string())?;
+        let total_len = expanded.len() as u64;
+        let truncated = total_len > max_bytes;
+        if truncated {
+            expanded.truncate(max_bytes as usize);
+        }
+        return Ok(TextBuiltinBytes {
+            bytes: expanded,
+            total_len,
+            truncated,
+            notice: None,
+        });
+    }
+
+    let total_len = meta_len;
+    let truncated = total_len > max_bytes;
+    let mut bytes = bytes;
+    if truncated {
+        bytes.truncate(max_bytes as usize);
+    }
+    Ok(TextBuiltinBytes {
+        bytes,
+        total_len,
+        truncated,
+        notice: None,
+    })
+}
+
+#[cfg(test)]
+mod text_builtin_bytes_tests {
+    use super::*;
+
+    fn make_tmp_dir(prefix: &str) -> std::path::PathBuf {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{prefix}-{uniq}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn z_auto_expands_arccompress_files() {
+        let dir = make_tmp_dir("templelinux-z-cat");
+        let path = dir.join("hello.Z");
+
+        let src = b"Hello, TempleOS!\nThis is a test.\n".to_vec();
+        let arc = temple_rt::tosz::compress_arc_compress_buf(&src);
+        std::fs::write(&path, arc).unwrap();
+
+        let res = read_text_builtin_bytes(&path, "hello.Z", 1024, 1024, 1024).unwrap();
+        assert_eq!(res.bytes, src);
+        assert_eq!(res.total_len, src.len() as u64);
+        assert!(!res.truncated);
+        assert!(res.notice.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn z_too_large_skips_expansion_with_notice() {
+        let dir = make_tmp_dir("templelinux-z-cat-too-large");
+        let path = dir.join("hello.Z");
+
+        let src = b"Hello, TempleOS!\nThis is a test.\n".to_vec();
+        let arc = temple_rt::tosz::compress_arc_compress_buf(&src);
+        std::fs::write(&path, arc).unwrap();
+        let meta_len = std::fs::metadata(&path).unwrap().len();
+
+        let res = read_text_builtin_bytes(&path, "hello.Z", 8, 1, 1024).unwrap();
+        assert_eq!(res.total_len, meta_len);
+        assert!(res.truncated);
+        assert!(res.notice.as_deref().unwrap_or("").contains(".Z not expanded"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn z_raw_files_are_treated_as_plain_bytes() {
+        let dir = make_tmp_dir("templelinux-z-raw");
+        let path = dir.join("raw.Z");
+
+        let src = b"not a Z file".to_vec();
+        std::fs::write(&path, &src).unwrap();
+
+        let res = read_text_builtin_bytes(&path, "raw.Z", 1024, 1024, 1024).unwrap();
+        assert_eq!(res.bytes, src);
+        assert_eq!(res.total_len, src.len() as u64);
+        assert!(!res.truncated);
+        assert!(res.notice.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 impl Shell {
-    fn new(test_mode: bool) -> Self {
+    fn new(test_mode: bool, audio: audio::Audio) -> Self {
         let root_dir = pick_temple_root(test_mode);
         let _ = std::fs::create_dir_all(&root_dir);
         let _ = std::fs::create_dir_all(root_dir.join("Home"));
@@ -126,6 +335,7 @@ impl Shell {
             history_pos: None,
             history_draft: String::new(),
             clipboard: HostClipboard::default(),
+            audio,
             vars: std::collections::BTreeMap::new(),
             tapp_connected: false,
             tapp_child: None,
@@ -134,13 +344,62 @@ impl Shell {
             pending_window_kinds: std::collections::VecDeque::new(),
             exit_requested: false,
             pending_screenshot: None,
+            last_error: None,
+            notifications: std::collections::VecDeque::new(),
             browser: None,
             doc_viewer: None,
+            song_playback: None,
         };
         if !test_mode {
             shell.load_state();
         }
         shell
+    }
+
+    fn set_last_error(&mut self, msg: impl Into<String>) {
+        self.last_error = Some(msg.into());
+    }
+
+    fn now_local_hms() -> String {
+        use nix::libc;
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let tm_ptr = unsafe { libc::localtime_r(&secs, &mut tm) };
+        if tm_ptr.is_null() {
+            "--:--:--".to_string()
+        } else {
+            format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+        }
+    }
+
+    fn trunc_chars(mut s: String, max_chars: usize) -> String {
+        if s.chars().count() <= max_chars {
+            return s;
+        }
+        s = s.chars().take(max_chars.saturating_sub(3).max(1)).collect();
+        s.push_str("...");
+        s
+    }
+
+    fn push_notification(&mut self, level: NotificationLevel, msg: impl Into<String>) {
+        const MAX_MSG_CHARS: usize = 160;
+
+        let entry = ShellNotification {
+            time_hms: Self::now_local_hms(),
+            level,
+            msg: Self::trunc_chars(msg.into(), MAX_MSG_CHARS),
+        };
+        if self.notifications.len() >= NOTIFICATIONS_MAX {
+            self.notifications.pop_front();
+        }
+        self.notifications.push_back(entry);
+    }
+
+    fn clear_notifications(&mut self) {
+        self.notifications.clear();
     }
 
     fn load_state(&mut self) {
@@ -709,6 +968,7 @@ impl Shell {
 
             match key {
                 Key::Named(NamedKey::Escape) => {
+                    self.stop_song_playback();
                     self.doc_viewer = None;
                     self.draw_prompt(term);
                     return true;
@@ -785,6 +1045,7 @@ impl Shell {
                     self.render_doc_viewer(term);
                 }
                 DocActionOutcome::CloseDocViewer => {
+                    self.stop_song_playback();
                     self.doc_viewer = None;
                     self.draw_prompt(term);
                 }
@@ -798,6 +1059,32 @@ impl Shell {
 
         self.render_doc_viewer(term);
         true
+    }
+
+    fn stop_song_playback(&mut self) {
+        if let Some(pb) = self.song_playback.take() {
+            pb.request_stop();
+        }
+        self.audio.snd(0);
+    }
+
+    fn start_song_playback(&mut self, song: &str) -> Result<(), String> {
+        let song = song.trim();
+        if song.is_empty() {
+            return Err("empty song".to_string());
+        }
+
+        self.stop_song_playback();
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let audio = self.audio.clone();
+        let song = song.to_string();
+        let stop_for_thread = stop.clone();
+
+        thread::spawn(move || psalmody_play_song(&song, audio, stop_for_thread));
+
+        self.song_playback = Some(SongPlayback { stop });
+        Ok(())
     }
 
 	    fn exec_doldoc_action(&mut self, action: &str, term: &mut Terminal) -> DocActionOutcome {
@@ -848,9 +1135,22 @@ impl Shell {
 		            }
 		        }
 
-	        if action.starts_with("templelinux:song:") {
-	            if let Some(state) = self.doc_viewer.as_mut() {
-	                state.msg = "song: unsupported".to_string();
+	        if let Some(song) = action.strip_prefix("templelinux:song:") {
+	            let song = song.trim();
+	            if song.is_empty() {
+	                return DocActionOutcome::Unsupported;
+	            }
+	            match self.start_song_playback(song) {
+	                Ok(()) => {
+	                    if let Some(state) = self.doc_viewer.as_mut() {
+	                        state.msg = "song: playing".to_string();
+	                    }
+	                }
+	                Err(err) => {
+	                    if let Some(state) = self.doc_viewer.as_mut() {
+	                        state.msg = format!("song: {err}");
+	                    }
+	                }
 	            }
 	            return DocActionOutcome::KeepDocViewer;
 	        }
@@ -1234,16 +1534,24 @@ impl Shell {
     }
 
     fn handle_key(&mut self, key: &Key, term: &mut Terminal) -> bool {
+        if matches!(key, Key::Named(NamedKey::F1)) {
+            self.stop_song_playback();
+            self.open_keymap_doc(term);
+            return true;
+        }
+
+        if matches!(key, Key::Named(NamedKey::F2)) {
+            self.stop_song_playback();
+            self.doc_viewer = None;
+            self.cmd_apps(&[], term);
+            return true;
+        }
+
         if self.doc_viewer.is_some() {
             return self.handle_key_doc_viewer(key, term);
         }
         if self.browser.is_some() {
             return self.handle_key_browser(key, term);
-        }
-
-        if matches!(key, Key::Named(NamedKey::F2)) {
-            self.cmd_apps(&[], term);
-            return true;
         }
 
         let mut changed = false;
@@ -1817,6 +2125,7 @@ impl Shell {
             "clip" => self.cmd_clip(line, &args, term),
             "env" => self.cmd_env(&args, term),
             "set" => self.cmd_set(&args, term),
+            "notifs" | "notify" => self.cmd_notifs(&args, term),
 	            "ws" => self.cmd_ws(&args, term),
 	            "run" => self.cmd_run(&args, term),
 	            "hc" | "holyc" => {
@@ -1838,7 +2147,9 @@ impl Shell {
             "shutdown" | "exit" => self.cmd_shutdown(&args, term),
             other => {
                 use fmt::Write as _;
-                let _ = writeln!(term, "Unknown command: {other}. Type 'help'.");
+                let msg = format!("Unknown command: {other}. Type 'help'.");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
             }
         }
     }
@@ -1912,6 +2223,7 @@ impl Shell {
             let _ = writeln!(term, "  Misc:");
             let _ = writeln!(term, "    env [name]           Show TempleShell vars");
             let _ = writeln!(term, "    set <k=v>            Set TempleShell var");
+            let _ = writeln!(term, "    notifs [n]           Notifications log (alias: notify)");
             let _ = writeln!(term, "    screenshot [path]    Save a PNG screenshot (alias: shot)");
             let _ = writeln!(term, "    shutdown             Exit TempleShell (alias: exit)");
             let _ = writeln!(term, "");
@@ -2039,6 +2351,11 @@ impl Shell {
                 let _ = writeln!(term, "set <name> <value...>");
                 let _ = writeln!(term, "set <name> (clears)");
             }
+            "notifs" | "notify" => {
+                let _ = writeln!(term, "notifs");
+                let _ = writeln!(term, "notifs <n>");
+                let _ = writeln!(term, "notifs clear");
+            }
             "open" => {
                 let _ = writeln!(term, "open <path>");
             }
@@ -2076,6 +2393,8 @@ impl Shell {
                 let _ = writeln!(term, "tapp hc [file.hc]");
                 let _ = writeln!(term, "tapp paint");
                 let _ = writeln!(term, "tapp linuxbridge");
+                let _ = writeln!(term, "tapp clipboardbridge");
+                let _ = writeln!(term, "tapp filebridge");
                 let _ = writeln!(term, "tapp timeclock");
                 let _ = writeln!(term, "tapp sounddemo");
                 let _ = writeln!(term, "tapp logic");
@@ -2126,6 +2445,9 @@ impl Shell {
 ## Shell prompt
 - `Enter` submit command
 - `Tab` complete commands/paths
+- `F1` key bindings (this page)
+- `F2` app launcher
+- `Esc` quit TempleShell
 - `Up`/`Down` history
 - `Left`/`Right` move cursor
 - `Home`/`End` line start/end
@@ -2150,9 +2472,11 @@ impl Shell {
 
 ## Window manager
 - Click window to focus; drag title to move
-- `Ctrl+W` close focused window
+- `Esc` close focused window
+- `Ctrl+W` close focused window (also works)
 - `Alt+Tab` cycle focus
 - `F2` open app launcher
+- `F1` key bindings
 "#;
 
         let bins: std::collections::BTreeMap<u32, Vec<u8>> = std::collections::BTreeMap::new();
@@ -2681,11 +3005,7 @@ impl Shell {
                 bins
             }
 
-            let cutoff = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-            let text_bytes = &buf[..cutoff];
-            let text = std::str::from_utf8(text_bytes)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|_| assets::decode_cp437_bytes(text_bytes));
+            let (text, cutoff) = decode_text_prefix(buf);
 
             if cutoff >= buf.len() {
                 return (text, std::collections::BTreeMap::new());
@@ -2924,6 +3244,10 @@ impl Shell {
         let mut fg = default_fg;
         let mut bg = default_bg;
         let mut indent_cols: i32 = 0;
+        let mut wrap_col: u32 = TERM_COLS;
+        let mut word_wrap: bool = false;
+        let mut page_header_lines: u32 = 0;
+        let mut page_footer_lines: u32 = 0;
         let mut meta = DolDocMeta::default();
 
         let mut bk_saved_bg: Option<u8> = None;
@@ -2931,36 +3255,105 @@ impl Shell {
         let mut hl_saved_fg: Option<u8> = None;
         let mut ul_saved_fg: Option<u8> = None;
 
-        fn write_text_chunk(term: &mut Terminal, chunk: &str, fg: u8, bg: u8, indent_cols: i32) {
+        fn write_text_chunk(
+            term: &mut Terminal,
+            chunk: &str,
+            fg: u8,
+            bg: u8,
+            indent_cols: i32,
+            wrap_col: u32,
+            word_wrap: bool,
+        ) {
             term.set_colors(fg, bg);
 
+            let wrap_col = wrap_col.clamp(1, TERM_COLS);
+            let indent_cols = indent_cols.clamp(0, TERM_COLS as i32 - 1);
+            let indent_cols = indent_cols
+                .min(wrap_col.saturating_sub(1) as i32)
+                .max(0) as u32;
+
+            let insert_indent = |term: &mut Terminal| {
+                if indent_cols == 0 || term.cursor_col != 0 {
+                    return;
+                }
+                for _ in 0..indent_cols.min(TERM_COLS) {
+                    term.put_char(' ');
+                }
+            };
+
             for line in chunk.split_inclusive('\n') {
-                let (mut body, has_nl) = line
+                let (body, has_nl) = line
                     .strip_suffix('\n')
                     .map(|s| (s, true))
                     .unwrap_or((line, false));
 
-                // TempleOS docs commonly embed "//" comments in the source that are not meant
-                // to display. Be conservative and only treat it as a comment when preceded
-                // by whitespace (to avoid "http://").
-                if let Some(pos) = body.find("//") {
-                    if pos == 0
-                        || body
-                            .as_bytes()
-                            .get(pos.saturating_sub(1))
-                            .is_some_and(|b| b.is_ascii_whitespace())
-                    {
-                        body = body[..pos].trim_end();
+                if wrap_col == TERM_COLS || !word_wrap {
+                    for ch in body.chars() {
+                        if ch != '\n' && wrap_col != TERM_COLS && term.cursor_col >= wrap_col {
+                            term.put_char('\n');
+                        }
+                        if ch != '\n' {
+                            insert_indent(term);
+                        }
+                        term.put_char(ch);
                     }
-                }
+                } else {
+                    let mut tok_is_space: Option<bool> = None;
+                    let mut tok = String::new();
 
-                for ch in body.chars() {
-                    if term.cursor_col == 0 && ch != '\n' && indent_cols > 0 {
-                        for _ in 0..(indent_cols as usize).min(TERM_COLS as usize) {
-                            term.put_char(' ');
+                    let flush = |term: &mut Terminal, is_space: bool, tok: &str| {
+                        if tok.is_empty() {
+                            return;
+                        }
+
+                        if is_space {
+                            for ch in tok.chars() {
+                                if term.cursor_col >= wrap_col {
+                                    term.put_char('\n');
+                                }
+                                insert_indent(term);
+                                term.put_char(ch);
+                            }
+                            return;
+                        }
+
+                        let word_len = tok.chars().count() as u32;
+                        if word_len < wrap_col
+                            && term.cursor_col > 0
+                            && term.cursor_col.saturating_add(word_len) > wrap_col
+                        {
+                            term.put_char('\n');
+                        }
+
+                        insert_indent(term);
+                        for ch in tok.chars() {
+                            if term.cursor_col >= wrap_col {
+                                term.put_char('\n');
+                                insert_indent(term);
+                            }
+                            term.put_char(ch);
+                        }
+                    };
+
+                    for ch in body.chars() {
+                        let is_space = ch == ' ' || ch == '\t';
+                        match tok_is_space {
+                            None => {
+                                tok_is_space = Some(is_space);
+                                tok.push(ch);
+                            }
+                            Some(prev) if prev == is_space => tok.push(ch),
+                            Some(prev) => {
+                                flush(term, prev, &tok);
+                                tok.clear();
+                                tok_is_space = Some(is_space);
+                                tok.push(ch);
+                            }
                         }
                     }
-                    term.put_char(ch);
+                    if let Some(is_space) = tok_is_space {
+                        flush(term, is_space, &tok);
+                    }
                 }
 
                 if has_nl {
@@ -3086,10 +3479,16 @@ impl Shell {
 	            fg: u8,
 	            bg: u8,
             indent_cols: i32,
+            wrap_col: u32,
             target: &DocLinkTarget,
             links: &mut Vec<DocLink>,
         ) {
             term.set_colors(fg, bg);
+            let wrap_col = wrap_col.clamp(1, TERM_COLS);
+            let indent_cols = indent_cols.clamp(0, TERM_COLS as i32 - 1);
+            let indent_cols = indent_cols
+                .min(wrap_col.saturating_sub(1) as i32)
+                .max(0) as u32;
 
             let mut cur: Option<(usize, usize, usize)> = None;
             let flush = |links: &mut Vec<DocLink>, cur: &mut Option<(usize, usize, usize)>| {
@@ -3104,25 +3503,19 @@ impl Shell {
             };
 
             for line in chunk.split_inclusive('\n') {
-                let (mut body, has_nl) = line
+                let (body, has_nl) = line
                     .strip_suffix('\n')
                     .map(|s| (s, true))
                     .unwrap_or((line, false));
 
-                if let Some(pos) = body.find("//") {
-                    if pos == 0
-                        || body
-                            .as_bytes()
-                            .get(pos.saturating_sub(1))
-                            .is_some_and(|b| b.is_ascii_whitespace())
-                    {
-                        body = body[..pos].trim_end();
-                    }
-                }
-
                 for ch in body.chars() {
+                    if ch != '\n' && wrap_col != TERM_COLS && term.cursor_col >= wrap_col {
+                        term.put_char('\n');
+                        flush(links, &mut cur);
+                    }
+
                     if term.cursor_col == 0 && ch != '\n' && indent_cols > 0 {
-                        for _ in 0..(indent_cols as usize).min(TERM_COLS as usize) {
+                        for _ in 0..indent_cols.min(TERM_COLS) {
                             let line_idx = term.scrollback.len() + term.cursor_row as usize;
                             let col_idx = term.cursor_col as usize;
                             match &mut cur {
@@ -3207,10 +3600,10 @@ impl Shell {
             (line0, col0, line1, col1)
         }
 
-        let mut rest = text;
-        while let Some(start) = rest.find('$') {
-            let (before, after) = rest.split_at(start);
-            write_text_chunk(term, before, fg, bg, indent_cols);
+	        let mut rest = text;
+	        while let Some(start) = rest.find('$') {
+	            let (before, after) = rest.split_at(start);
+	            write_text_chunk(term, before, fg, bg, indent_cols, wrap_col, word_wrap);
 
             // TempleOS DolDoc escaping:
             // - "$$" renders a literal '$'
@@ -3219,48 +3612,104 @@ impl Shell {
             if after.starts_with("$$") {
                 if after.starts_with("$$$") {
                     if let Some(end_rel) = after[3..].find("$$$") {
-                        let inner = &after[3..3 + end_rel];
-                        write_text_chunk(term, "$", fg, bg, indent_cols);
-                        write_text_chunk(term, inner, fg, bg, indent_cols);
-                        write_text_chunk(term, "$", fg, bg, indent_cols);
-                        rest = &after[3 + end_rel + 3..];
-                        continue;
-                    }
-                }
+	                        let inner = &after[3..3 + end_rel];
+                            if !inner.contains('$') {
+                                write_text_chunk(term, "$", fg, bg, indent_cols, wrap_col, word_wrap);
+                                write_text_chunk(term, inner, fg, bg, indent_cols, wrap_col, word_wrap);
+                                write_text_chunk(term, "$", fg, bg, indent_cols, wrap_col, word_wrap);
+                                rest = &after[3 + end_rel + 3..];
+                                continue;
+                            }
+	                    }
+	                }
 
-                write_text_chunk(term, "$", fg, bg, indent_cols);
-                rest = &after[2..];
-                continue;
-            }
+	                write_text_chunk(term, "$", fg, bg, indent_cols, wrap_col, word_wrap);
+	                rest = &after[2..];
+	                continue;
+	            }
 
             let after = &after[1..];
-            let Some(end) = after.find('$') else {
-                // Unterminated command; render the rest literally.
-                write_text_chunk(term, "$", fg, bg, indent_cols);
-                write_text_chunk(term, after, fg, bg, indent_cols);
-                rest = "";
-                break;
-            };
+	            let Some(end) = after.find('$') else {
+	                // Unterminated command; render the rest literally.
+	                write_text_chunk(term, "$", fg, bg, indent_cols, wrap_col, word_wrap);
+	                write_text_chunk(term, after, fg, bg, indent_cols, wrap_col, word_wrap);
+	                rest = "";
+	                break;
+	            };
 
             let (cmd, after_cmd) = after.split_at(end);
             rest = &after_cmd[1..];
 
-            let cmd = cmd.trim();
-            if cmd.is_empty() {
-                write_text_chunk(term, "$", fg, bg, indent_cols);
-                continue;
-            }
+	            let cmd = cmd.trim();
+	            if cmd.is_empty() {
+	                write_text_chunk(term, "$", fg, bg, indent_cols, wrap_col, word_wrap);
+	                continue;
+	            }
 
             let (op_flags, args) = cmd.split_once(',').unwrap_or((cmd, ""));
             let mut parts = op_flags.split('+');
             let op = parts.next().unwrap_or("").trim();
             let flags: Vec<&str> = parts.collect();
 
-            match op {
-                "FG" => {
-                    let arg = args.trim();
-                    if arg.is_empty() {
-                        fg = default_fg;
+	            match op {
+	                "HD" => {
+	                    let arg = args.trim();
+	                    if arg.is_empty() {
+	                        page_header_lines = 0;
+	                    } else if let Ok(v) = arg.parse::<u32>() {
+	                        page_header_lines = v.min(OUTPUT_ROWS);
+	                        if term.cursor_col == 0 && term.cursor_row == 0 && term.scrollback.is_empty()
+	                        {
+	                            for _ in 0..page_header_lines {
+	                                term.put_char('\n');
+	                            }
+	                        }
+	                    }
+	                }
+	                "FO" => {
+	                    let arg = args.trim();
+	                    if arg.is_empty() {
+	                        page_footer_lines = 0;
+	                    } else if let Ok(v) = arg.parse::<u32>() {
+	                        page_footer_lines = v.min(OUTPUT_ROWS);
+	                    }
+	                }
+	                "LM" => {
+	                    let arg = args.trim();
+	                    if arg.is_empty() {
+	                        indent_cols = 0;
+	                    } else if let Ok(v) = arg.parse::<i32>() {
+	                        indent_cols = v.clamp(0, TERM_COLS as i32 - 1);
+	                    }
+	                }
+	                "RM" => {
+	                    let arg = args.trim();
+	                    if arg.is_empty() {
+	                        wrap_col = TERM_COLS;
+	                    } else if let Ok(v) = arg.parse::<i32>() {
+	                        if v > 0 {
+	                            wrap_col = (v as u32).clamp(1, TERM_COLS);
+	                        }
+	                    }
+	                }
+	                "PB" => {
+	                    if term.cursor_col != 0 {
+	                        term.put_char('\n');
+	                    }
+	                    for _ in 0..page_footer_lines {
+	                        term.put_char('\n');
+	                    }
+	                    for _ in 0..TERM_COLS {
+	                        term.put_char('─');
+	                    }
+	                    for _ in 0..page_header_lines {
+	                        term.put_char('\n');
+	                    }
+	                }
+	                "FG" => {
+	                    let arg = args.trim();
+	                    if arg.is_empty() {
+	                        fg = default_fg;
                     } else if let Ok(v) = arg.parse::<u8>() {
                         fg = v.min(15);
                     }
@@ -3273,9 +3722,13 @@ impl Shell {
                         bg = v.min(15);
                     }
                 }
-                "WW" => {
-                    // Word-wrap control. We always wrap at TERM_COLS; ignore for now.
-                }
+	                "WW" => {
+	                    // Word-wrap control. TempleLinux only applies word-wrapping when a narrower
+	                    // right margin is set (e.g. in `Demo/DolDoc/DemoDoc.DD`) so existing docs
+	                    // remain pixel-stable.
+	                    let v = args.trim().parse::<i32>().unwrap_or(0);
+	                    word_wrap = v != 0;
+	                }
                 "CM-RE" => {
                     // Cursor move (X only). Used by docs like `Doc/Job.DD` for column layouts.
                     let x = parse_kv_i32(args, "LE").or_else(|| args.trim().parse::<i32>().ok());
@@ -3302,19 +3755,55 @@ impl Shell {
                     });
 
                     if let Some(y) = y {
-                        if y > 0 {
+                        let ty = flags.iter().any(|f| f.eq_ignore_ascii_case(&"TY"));
+                        let cy = flags.iter().any(|f| f.eq_ignore_ascii_case(&"CY"));
+                        let by = flags.iter().any(|f| f.eq_ignore_ascii_case(&"BY"));
+                        let _pry = flags.iter().any(|f| f.eq_ignore_ascii_case(&"PRY"));
+
+                        if ty || cy || by {
+                            let base_row: i32 = if ty {
+                                0
+                            } else if cy {
+                                (term.scroll_rows as i32) / 2
+                            } else {
+                                (term.scroll_rows as i32).saturating_sub(1)
+                            };
+                            let row = base_row.saturating_add(y);
+                            term.cursor_row =
+                                row.clamp(0, term.scroll_rows as i32 - 1).max(0) as u32;
+                        } else if y > 0 {
                             for _ in 0..y {
                                 term.put_char('\n');
                             }
+                        } else if y < 0 {
+                            term.cursor_row = term.cursor_row.saturating_sub((-y) as u32);
                         }
                     }
 
                     if let Some(x) = x {
                         let mut col = term.cursor_col as i32;
-                        if flags.iter().any(|f| f.eq_ignore_ascii_case(&"LX")) {
-                            col = x;
-                        } else if flags.iter().any(|f| f.eq_ignore_ascii_case(&"RX")) {
-                            col = TERM_COLS as i32 + x;
+                        let lx = flags.iter().any(|f| f.eq_ignore_ascii_case(&"LX"));
+                        let cx = flags.iter().any(|f| f.eq_ignore_ascii_case(&"CX"));
+                        let rx = flags.iter().any(|f| f.eq_ignore_ascii_case(&"RX"));
+                        let mrx = flags.iter().any(|f| f.eq_ignore_ascii_case(&"MRX"));
+
+                        if lx || cx || rx {
+                            if lx {
+                                let base = if mrx { indent_cols } else { 0 };
+                                col = base.saturating_add(x);
+                            } else if cx {
+                                let base = if mrx {
+                                    let indent = indent_cols;
+                                    let right = wrap_col as i32;
+                                    indent.saturating_add((right.saturating_sub(indent)) / 2)
+                                } else {
+                                    (TERM_COLS as i32) / 2
+                                };
+                                col = base.saturating_add(x);
+                            } else {
+                                let base = if mrx { wrap_col as i32 } else { TERM_COLS as i32 };
+                                col = base.saturating_add(x);
+                            }
                         } else {
                             col += x;
                         }
@@ -3417,29 +3906,90 @@ impl Shell {
                         .or(second)
                         .unwrap_or_else(|| label.clone());
                     let target = target.trim().to_string();
-                    if target.is_empty() {
+	                    if target.is_empty() {
+	                        continue;
+	                    }
+
+	                    let target = DocLinkTarget::Doc(target);
+	                    write_link_chunk(
+	                        term,
+	                        &label,
+	                        10,
+	                        bg,
+	                        indent_cols,
+	                        wrap_col,
+	                        &target,
+	                        &mut meta.links,
+	                    );
+	                    term.set_colors(fg, bg);
+                }
+                "TX" => {
+                    let html_url = parse_attr_quoted(cmd, "HTML")
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+
+                    let cx = flags.iter().any(|f| f.eq_ignore_ascii_case(&"CX"));
+                    let mut shown = parse_quoted_args(cmd, 1).into_iter().next().unwrap_or_default();
+
+                    if let Some(url) = html_url {
+                        if shown.trim().is_empty() {
+                            shown = url_label(&url);
+                        }
+                        let shown = shown.trim().to_string();
+                        if shown.is_empty() {
+                            continue;
+                        }
+
+                        if url.starts_with("http://") || url.starts_with("https://") {
+                            let target = DocLinkTarget::Action(format!("templelinux:browse:{url}"));
+                            if cx {
+                                let row = term.cursor_row.min(PROMPT_ROW.saturating_sub(1));
+                                let len = shown.chars().count().min(TERM_COLS as usize);
+                                let col = TERM_COLS.saturating_sub(len as u32) / 2;
+                                term.write_at(col, row, 10, bg, &shown);
+
+                                let line_idx = term.scrollback.len() + row as usize;
+                                meta.links.push(DocLink {
+                                    line: line_idx,
+                                    col_start: col as usize,
+                                    col_end: col as usize + len,
+                                    target,
+                                });
+
+                                term.cursor_row = row;
+                                term.cursor_col = (col + len as u32).min(TERM_COLS);
+                            } else {
+                                write_link_chunk(
+                                    term,
+                                    &shown,
+                                    10,
+                                    bg,
+                                    indent_cols,
+                                    wrap_col,
+                                    &target,
+                                    &mut meta.links,
+                                );
+                                term.set_colors(fg, bg);
+                            }
+                            continue;
+                        }
+                    }
+
+                    if shown.is_empty() {
                         continue;
                     }
 
-                    let target = DocLinkTarget::Doc(target);
-                    write_link_chunk(term, &label, 10, bg, indent_cols, &target, &mut meta.links);
-                    term.set_colors(fg, bg);
-	                }
-	                "TX" => {
-	                    if let Some(s) = parse_quoted_args(cmd, 1).into_iter().next() {
-	                        let cx = flags.iter().any(|f| f.eq_ignore_ascii_case(&"CX"));
-	                        if cx {
-                            let row = term.cursor_row.min(PROMPT_ROW.saturating_sub(1));
-                            let len = s.chars().count().min(TERM_COLS as usize);
-                            let col = TERM_COLS.saturating_sub(len as u32) / 2;
-                            term.write_at(col, row, fg, bg, &s);
-                            term.cursor_row = row;
-                            term.cursor_col = (col + len as u32).min(TERM_COLS);
-                        } else {
-                            write_text_chunk(term, &s, fg, bg, indent_cols);
-                        }
-	                    }
-	                }
+                    if cx {
+                        let row = term.cursor_row.min(PROMPT_ROW.saturating_sub(1));
+                        let len = shown.chars().count().min(TERM_COLS as usize);
+                        let col = TERM_COLS.saturating_sub(len as u32) / 2;
+                        term.write_at(col, row, fg, bg, &shown);
+                        term.cursor_row = row;
+                        term.cursor_col = (col + len as u32).min(TERM_COLS);
+                    } else {
+                        write_text_chunk(term, &shown, fg, bg, indent_cols, wrap_col, word_wrap);
+                    }
+                }
 	                // HTML blocks (often images/embeds). TempleOS uses these primarily for HTML export;
 	                // show a small placeholder and optionally expose the first URL as a clickable link.
 	                "HC" => {
@@ -3447,21 +3997,22 @@ impl Shell {
 	                    if let Some(url) = extract_first_http_url(&html) {
 	                        let label = url_label(&url);
 	                        let target = DocLinkTarget::Action(format!("templelinux:browse:{url}"));
-	                        write_link_chunk(
-	                            term,
-	                            &label,
-	                            10,
-	                            bg,
-	                            indent_cols,
-	                            &target,
-	                            &mut meta.links,
-	                        );
-	                        term.set_colors(fg, bg);
-	                    } else {
-	                        write_text_chunk(term, "[html]", fg, bg, indent_cols);
-	                        term.set_colors(fg, bg);
-	                    }
-	                }
+		                        write_link_chunk(
+		                            term,
+		                            &label,
+		                            10,
+		                            bg,
+		                            indent_cols,
+		                            wrap_col,
+		                            &target,
+		                            &mut meta.links,
+		                        );
+		                        term.set_colors(fg, bg);
+		                    } else {
+		                        write_text_chunk(term, "[html]", fg, bg, indent_cols, wrap_col, word_wrap);
+		                        term.set_colors(fg, bg);
+		                    }
+		                }
 	                // Psalmody songs embedded in docs.
 	                "SO" => {
 	                    let label = parse_quoted_args(cmd, 1).into_iter().next();
@@ -3478,20 +4029,21 @@ impl Shell {
 
 	                    if let Some(song) = action {
 	                        let target = DocLinkTarget::Action(format!("templelinux:song:{song}"));
-	                        write_link_chunk(
-	                            term,
-	                            shown,
-	                            10,
-	                            bg,
-	                            indent_cols,
-	                            &target,
-	                            &mut meta.links,
-	                        );
-	                    } else {
-	                        write_text_chunk(term, shown, fg, bg, indent_cols);
-	                    }
-	                    term.set_colors(fg, bg);
-	                }
+		                        write_link_chunk(
+		                            term,
+		                            shown,
+		                            10,
+		                            bg,
+		                            indent_cols,
+		                            wrap_col,
+		                            &target,
+		                            &mut meta.links,
+		                        );
+		                    } else {
+		                        write_text_chunk(term, shown, fg, bg, indent_cols, wrap_col, word_wrap);
+		                    }
+		                    term.set_colors(fg, bg);
+		                }
                 "SP" => {
                     // Sprite: `BI=<n>` refers to binary data stored after the NUL terminator
                     // in `.DD` files (TempleOS `CDocBin` tail).
@@ -3507,18 +4059,19 @@ impl Shell {
                     if !tag.is_empty() {
                         if let Some(action) = action.as_ref() {
                             let target = DocLinkTarget::Action(action.clone());
-                            write_link_chunk(
-                                term,
-                                &tag,
-                                10,
-                                bg,
-                                indent_cols,
-                                &target,
-                                &mut meta.links,
-                            );
-                        } else {
-                            write_text_chunk(term, &tag, fg, bg, indent_cols);
-                        }
+		                            write_link_chunk(
+		                                term,
+		                                &tag,
+		                                10,
+		                                bg,
+		                                indent_cols,
+		                                wrap_col,
+		                                &target,
+		                                &mut meta.links,
+		                            );
+		                        } else {
+		                            write_text_chunk(term, &tag, fg, bg, indent_cols, wrap_col, word_wrap);
+		                        }
                         term.set_colors(fg, bg);
                     }
 
@@ -3550,12 +4103,12 @@ impl Shell {
                             bin_num,
                             action,
                         });
-                    } else if tag.is_empty() {
-                        // Fallback: show a small placeholder tag so docs don't look like they're missing content.
-                        write_text_chunk(term, "[sprite]", fg, bg, indent_cols);
-                        term.set_colors(fg, bg);
-                    }
-                }
+	                    } else if tag.is_empty() {
+	                        // Fallback: show a small placeholder tag so docs don't look like they're missing content.
+	                        write_text_chunk(term, "[sprite]", fg, bg, indent_cols, wrap_col, word_wrap);
+	                        term.set_colors(fg, bg);
+	                    }
+	                }
                 // Insert Binary (pointer): not visual; show a minimal placeholder.
                 "IB" => {
                     let tag = parse_quoted_args(cmd, 1).into_iter().next().unwrap_or_default();
@@ -3596,15 +4149,15 @@ impl Shell {
                             }
 
                             term.set_colors(fg, bg);
-                        } else {
-                            write_text_chunk(term, "[bin]", fg, bg, indent_cols);
-                            term.set_colors(fg, bg);
-                        }
-                    } else {
-                        write_text_chunk(term, &tag, fg, bg, indent_cols);
-                        term.set_colors(fg, bg);
-                    }
-                }
+	                        } else {
+	                            write_text_chunk(term, "[bin]", fg, bg, indent_cols, wrap_col, word_wrap);
+	                            term.set_colors(fg, bg);
+	                        }
+	                    } else {
+	                        write_text_chunk(term, &tag, fg, bg, indent_cols, wrap_col, word_wrap);
+	                        term.set_colors(fg, bg);
+	                    }
+	                }
                 // Menu anchors are often directory links in DemoIndex.
                 "MA-X" | "MA" => {
                     let label = parse_quoted_args(cmd, 1).into_iter().next();
@@ -3628,27 +4181,36 @@ impl Shell {
                         DocLinkTarget::Doc(shown.to_string())
                     };
 
-                    write_link_chunk(term, shown, 10, bg, indent_cols, &target, &mut meta.links);
-                    term.set_colors(fg, bg);
-                }
+	                    write_link_chunk(
+	                        term,
+	                        shown,
+	                        10,
+	                        bg,
+	                        indent_cols,
+	                        wrap_col,
+	                        &target,
+	                        &mut meta.links,
+	                    );
+	                    term.set_colors(fg, bg);
+	                }
                 other => {
                     // Best-effort: if the command carries a quoted label/path, show it.
                     if let Some(s) = parse_quoted_args(cmd, 1).into_iter().next() {
-                        let color = match other {
-                            "MA-X" | "MA" => 10,
-                            _ => fg,
-                        };
-                        write_text_chunk(term, &s, color, bg, indent_cols);
-                        term.set_colors(fg, bg);
-                    }
-                }
+	                        let color = match other {
+	                            "MA-X" | "MA" => 10,
+	                            _ => fg,
+	                        };
+	                        write_text_chunk(term, &s, color, bg, indent_cols, wrap_col, word_wrap);
+	                        term.set_colors(fg, bg);
+	                    }
+	                }
             }
         }
 
-        write_text_chunk(term, rest, fg, bg, indent_cols);
-        term.set_colors(default_fg, default_bg);
-        meta
-    }
+	        write_text_chunk(term, rest, fg, bg, indent_cols, wrap_col, word_wrap);
+	        term.set_colors(default_fg, default_bg);
+	        meta
+	    }
 
     fn cmd_pwd(&self, term: &mut Terminal) {
         use fmt::Write as _;
@@ -3666,16 +4228,20 @@ impl Shell {
             }
             Ok(_) => {
                 use fmt::Write as _;
-                let _ = writeln!(term, "cd: not a directory: {target}");
+                let msg = format!("cd: not a directory: {target}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
             }
             Err(err) => {
                 use fmt::Write as _;
-                let _ = writeln!(term, "cd: {target}: {err}");
+                let msg = format!("cd: {target}: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
             }
         }
     }
 
-    fn cmd_ls(&self, args: &[&str], term: &mut Terminal) {
+    fn cmd_ls(&mut self, args: &[&str], term: &mut Terminal) {
         let target = args.first().copied().unwrap_or(".");
         let path = self.cwd.resolve(target);
         let host = path.to_host_path(&self.root_dir);
@@ -3684,7 +4250,9 @@ impl Shell {
             Ok(m) => m,
             Err(err) => {
                 use fmt::Write as _;
-                let _ = writeln!(term, "ls: {target}: {err}");
+                let msg = format!("ls: {target}: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
                 return;
             }
         };
@@ -3699,7 +4267,9 @@ impl Shell {
             Ok(e) => e,
             Err(err) => {
                 use fmt::Write as _;
-                let _ = writeln!(term, "ls: {target}: {err}");
+                let msg = format!("ls: {target}: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
                 return;
             }
         };
@@ -3721,12 +4291,14 @@ impl Shell {
         }
     }
 
-    fn cmd_cat(&self, args: &[&str], term: &mut Terminal) {
+    fn cmd_cat(&mut self, args: &[&str], term: &mut Terminal) {
         const CAT_MAX_BYTES: u64 = 256 * 1024;
 
         let Some(target) = args.first().copied() else {
             use fmt::Write as _;
-            let _ = writeln!(term, "cat: missing path");
+            let msg = "cat: missing path".to_string();
+            let _ = writeln!(term, "{msg}");
+            self.set_last_error(msg);
             return;
         };
 
@@ -3736,7 +4308,9 @@ impl Shell {
             Ok(f) => f,
             Err(err) => {
                 use fmt::Write as _;
-                let _ = writeln!(term, "cat: {target}: {err}");
+                let msg = format!("cat: {target}: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
                 return;
             }
         };
@@ -3745,14 +4319,18 @@ impl Shell {
             Ok(m) => m,
             Err(err) => {
                 use fmt::Write as _;
-                let _ = writeln!(term, "cat: {target}: {err}");
+                let msg = format!("cat: {target}: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
                 return;
             }
         };
 
         if meta.is_dir() {
             use fmt::Write as _;
-            let _ = writeln!(term, "cat: {target}: is a directory");
+            let msg = format!("cat: {target}: is a directory");
+            let _ = writeln!(term, "{msg}");
+            self.set_last_error(msg);
             return;
         }
 
@@ -3761,32 +4339,45 @@ impl Shell {
             return;
         }
 
-        use std::io::Read as _;
-        let mut buf = Vec::new();
-        if let Err(err) = file.take(CAT_MAX_BYTES).read_to_end(&mut buf) {
-            use fmt::Write as _;
-            let _ = writeln!(term, "cat: {target}: {err}");
-            return;
+        use fmt::Write as _;
+        let res = match read_text_builtin_bytes(
+            &host,
+            target,
+            CAT_MAX_BYTES,
+            TEXT_BUILTIN_Z_MAX_COMPRESSED_BYTES,
+            TEXT_BUILTIN_Z_MAX_EXPANDED_BYTES,
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                let msg = format!("cat: {target}: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
+                return;
+            }
+        };
+        if let Some(notice) = &res.notice {
+            let _ = writeln!(term, "{notice}");
         }
 
-        use fmt::Write as _;
-        let text = String::from_utf8_lossy(&buf);
+        let (text, _) = decode_text_prefix(&res.bytes);
         let _ = write!(term, "{text}");
         if !text.ends_with('\n') {
             let _ = writeln!(term, "");
         }
-        if meta.len() > CAT_MAX_BYTES {
-            let _ = writeln!(term, "[truncated: {} bytes total]", meta.len());
+        if res.truncated {
+            let _ = writeln!(term, "[truncated: {} bytes total]", res.total_len);
         }
     }
 
-    fn cmd_cp(&self, args: &[&str], term: &mut Terminal) {
+    fn cmd_cp(&mut self, args: &[&str], term: &mut Terminal) {
         let Some((src, dst)) = args
             .split_first()
             .and_then(|(a, rest)| rest.first().map(|b| (*a, *b)))
         else {
             use fmt::Write as _;
-            let _ = writeln!(term, "cp: expected: cp <src> <dst>");
+            let msg = "cp: expected: cp <src> <dst>".to_string();
+            let _ = writeln!(term, "{msg}");
+            self.set_last_error(msg);
             return;
         };
 
@@ -3799,13 +4390,17 @@ impl Shell {
             Ok(m) => m,
             Err(err) => {
                 use fmt::Write as _;
-                let _ = writeln!(term, "cp: {src}: {err}");
+                let msg = format!("cp: {src}: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
                 return;
             }
         };
         if src_meta.is_dir() {
             use fmt::Write as _;
-            let _ = writeln!(term, "cp: {src}: is a directory");
+            let msg = format!("cp: {src}: is a directory");
+            let _ = writeln!(term, "{msg}");
+            self.set_last_error(msg);
             return;
         }
 
@@ -3824,18 +4419,22 @@ impl Shell {
             }
             Err(err) => {
                 use fmt::Write as _;
-                let _ = writeln!(term, "cp: {err}");
+                let msg = format!("cp: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
             }
         }
     }
 
-    fn cmd_mv(&self, args: &[&str], term: &mut Terminal) {
+    fn cmd_mv(&mut self, args: &[&str], term: &mut Terminal) {
         let Some((src, dst)) = args
             .split_first()
             .and_then(|(a, rest)| rest.first().map(|b| (*a, *b)))
         else {
             use fmt::Write as _;
-            let _ = writeln!(term, "mv: expected: mv <src> <dst>");
+            let msg = "mv: expected: mv <src> <dst>".to_string();
+            let _ = writeln!(term, "{msg}");
+            self.set_last_error(msg);
             return;
         };
 
@@ -3868,23 +4467,29 @@ impl Shell {
                             }
                             Err(err) => {
                                 use fmt::Write as _;
-                                let _ = writeln!(term, "mv: remove src: {err}");
+                                let msg = format!("mv: remove src: {err}");
+                                let _ = writeln!(term, "{msg}");
+                                self.set_last_error(msg);
                             }
                         },
                         Err(err) => {
                             use fmt::Write as _;
-                            let _ = writeln!(term, "mv: copy fallback failed: {err}");
+                            let msg = format!("mv: copy fallback failed: {err}");
+                            let _ = writeln!(term, "{msg}");
+                            self.set_last_error(msg);
                         }
                     }
                 } else {
                     use fmt::Write as _;
-                    let _ = writeln!(term, "mv: {err}");
+                    let msg = format!("mv: {err}");
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                 }
             }
         }
     }
 
-    fn cmd_rm(&self, args: &[&str], term: &mut Terminal) {
+    fn cmd_rm(&mut self, args: &[&str], term: &mut Terminal) {
         use fmt::Write as _;
 
         let mut recursive = false;
@@ -3897,7 +4502,9 @@ impl Shell {
         }
 
         let Some(target) = rest.first().copied() else {
-            let _ = writeln!(term, "rm: expected: rm [-r] <path>");
+            let msg = "rm: expected: rm [-r] <path>".to_string();
+            let _ = writeln!(term, "{msg}");
+            self.set_last_error(msg);
             return;
         };
 
@@ -3906,14 +4513,18 @@ impl Shell {
         let meta = match std::fs::metadata(&host) {
             Ok(m) => m,
             Err(err) => {
-                let _ = writeln!(term, "rm: {target}: {err}");
+                let msg = format!("rm: {target}: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
                 return;
             }
         };
 
         if meta.is_dir() {
             if !recursive {
-                let _ = writeln!(term, "rm: {target}: is a directory (use rm -r)");
+                let msg = format!("rm: {target}: is a directory (use rm -r)");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
                 return;
             }
             match std::fs::remove_dir_all(&host) {
@@ -3921,7 +4532,9 @@ impl Shell {
                     let _ = writeln!(term, "rm: ok");
                 }
                 Err(err) => {
-                    let _ = writeln!(term, "rm: {target}: {err}");
+                    let msg = format!("rm: {target}: {err}");
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                 }
             }
             return;
@@ -3932,16 +4545,20 @@ impl Shell {
                 let _ = writeln!(term, "rm: ok");
             }
             Err(err) => {
-                let _ = writeln!(term, "rm: {target}: {err}");
+                let msg = format!("rm: {target}: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
             }
         }
     }
 
-    fn cmd_mkdir(&self, args: &[&str], term: &mut Terminal) {
+    fn cmd_mkdir(&mut self, args: &[&str], term: &mut Terminal) {
         use fmt::Write as _;
 
         let Some(target) = args.first().copied() else {
-            let _ = writeln!(term, "mkdir: expected: mkdir <path>");
+            let msg = "mkdir: expected: mkdir <path>".to_string();
+            let _ = writeln!(term, "{msg}");
+            self.set_last_error(msg);
             return;
         };
 
@@ -3952,16 +4569,20 @@ impl Shell {
                 let _ = writeln!(term, "mkdir: ok");
             }
             Err(err) => {
-                let _ = writeln!(term, "mkdir: {target}: {err}");
+                let msg = format!("mkdir: {target}: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
             }
         }
     }
 
-    fn cmd_touch(&self, args: &[&str], term: &mut Terminal) {
+    fn cmd_touch(&mut self, args: &[&str], term: &mut Terminal) {
         use fmt::Write as _;
 
         let Some(target) = args.first().copied() else {
-            let _ = writeln!(term, "touch: expected: touch <path>");
+            let msg = "touch: expected: touch <path>".to_string();
+            let _ = writeln!(term, "{msg}");
+            self.set_last_error(msg);
             return;
         };
 
@@ -3976,44 +4597,50 @@ impl Shell {
                 let _ = writeln!(term, "touch: ok");
             }
             Err(err) => {
-                let _ = writeln!(term, "touch: {target}: {err}");
+                let msg = format!("touch: {target}: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
             }
         }
     }
 
-    fn cmd_grep(&self, args: &[&str], term: &mut Terminal) {
+    fn cmd_grep(&mut self, args: &[&str], term: &mut Terminal) {
         use fmt::Write as _;
 
         const GREP_MAX_BYTES: u64 = 1024 * 1024;
 
         let Some(needle) = args.first().copied() else {
-            let _ = writeln!(term, "grep: expected: grep <needle> <path>");
+            let msg = "grep: expected: grep <needle> <path>".to_string();
+            let _ = writeln!(term, "{msg}");
+            self.set_last_error(msg);
             return;
         };
         let Some(target) = args.get(1).copied() else {
-            let _ = writeln!(term, "grep: expected: grep <needle> <path>");
+            let msg = "grep: expected: grep <needle> <path>".to_string();
+            let _ = writeln!(term, "{msg}");
+            self.set_last_error(msg);
             return;
         };
 
         let path = self.cwd.resolve(target);
         let host = path.to_host_path(&self.root_dir);
-        let file = match std::fs::File::open(&host) {
-            Ok(f) => f,
+        let res = match read_text_builtin_bytes(
+            &host,
+            target,
+            GREP_MAX_BYTES,
+            TEXT_BUILTIN_Z_MAX_COMPRESSED_BYTES,
+            TEXT_BUILTIN_Z_MAX_EXPANDED_BYTES,
+        ) {
+            Ok(v) => v,
             Err(err) => {
-                let _ = writeln!(term, "grep: {target}: {err}");
+                let msg = format!("grep: {target}: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
                 return;
             }
         };
-        let meta_len = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
 
-        use std::io::Read as _;
-        let mut buf = Vec::new();
-        if let Err(err) = file.take(GREP_MAX_BYTES).read_to_end(&mut buf) {
-            let _ = writeln!(term, "grep: {target}: {err}");
-            return;
-        }
-
-        let text = String::from_utf8_lossy(&buf);
+        let (text, _) = decode_text_prefix(&res.bytes);
         let mut hits = 0usize;
         for (idx, line) in text.lines().enumerate() {
             if line.contains(needle) {
@@ -4021,15 +4648,18 @@ impl Shell {
                 let _ = writeln!(term, "{}:{}", idx + 1, line);
             }
         }
-        if meta_len > GREP_MAX_BYTES {
-            let _ = writeln!(term, "[truncated: {} bytes total]", meta_len);
+        if res.truncated {
+            let _ = writeln!(term, "[truncated: {} bytes total]", res.total_len);
+        }
+        if let Some(notice) = &res.notice {
+            let _ = writeln!(term, "{notice}");
         }
         if hits == 0 {
             let _ = writeln!(term, "[no matches]");
         }
     }
 
-    fn cmd_find(&self, args: &[&str], term: &mut Terminal) {
+    fn cmd_find(&mut self, args: &[&str], term: &mut Terminal) {
         use fmt::Write as _;
 
         let (start, needle) = match args {
@@ -4037,7 +4667,9 @@ impl Shell {
             [path] => (self.cwd.resolve(path), None),
             [path, needle] => (self.cwd.resolve(path), Some(*needle)),
             _ => {
-                let _ = writeln!(term, "find: expected: find [path] [name-substring]");
+                let msg = "find: expected: find [path] [name-substring]".to_string();
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
                 return;
             }
         };
@@ -4050,7 +4682,9 @@ impl Shell {
             let entries = match std::fs::read_dir(&host) {
                 Ok(e) => e,
                 Err(err) => {
-                    let _ = writeln!(term, "find: {}: {err}", dir.display());
+                    let msg = format!("find: {}: {err}", dir.display());
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     continue;
                 }
             };
@@ -4083,7 +4717,7 @@ impl Shell {
         }
     }
 
-    fn cmd_head(&self, args: &[&str], term: &mut Terminal) {
+    fn cmd_head(&mut self, args: &[&str], term: &mut Terminal) {
         use fmt::Write as _;
 
         const MAX_BYTES: u64 = 1024 * 1024;
@@ -4092,43 +4726,51 @@ impl Shell {
             ["-n", n, path] => match n.parse::<usize>() {
                 Ok(v) => (v, *path),
                 Err(_) => {
-                    let _ = writeln!(term, "head: bad -n: {n}");
+                    let msg = format!("head: bad -n: {n}");
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     return;
                 }
             },
             _ => {
-                let _ = writeln!(term, "head: expected: head [-n N] <path>");
+                let msg = "head: expected: head [-n N] <path>".to_string();
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
                 return;
             }
         };
 
         let path = self.cwd.resolve(target);
         let host = path.to_host_path(&self.root_dir);
-        let file = match std::fs::File::open(&host) {
-            Ok(f) => f,
+        let res = match read_text_builtin_bytes(
+            &host,
+            target,
+            MAX_BYTES,
+            TEXT_BUILTIN_Z_MAX_COMPRESSED_BYTES,
+            TEXT_BUILTIN_Z_MAX_EXPANDED_BYTES,
+        ) {
+            Ok(v) => v,
             Err(err) => {
-                let _ = writeln!(term, "head: {target}: {err}");
+                let msg = format!("head: {target}: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
                 return;
             }
         };
-        let meta_len = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
-
-        use std::io::Read as _;
-        let mut buf = Vec::new();
-        if let Err(err) = file.take(MAX_BYTES).read_to_end(&mut buf) {
-            let _ = writeln!(term, "head: {target}: {err}");
-            return;
+        if let Some(notice) = &res.notice {
+            let _ = writeln!(term, "{notice}");
         }
-        let text = String::from_utf8_lossy(&buf);
+
+        let (text, _) = decode_text_prefix(&res.bytes);
         for line in text.lines().take(n) {
             let _ = writeln!(term, "{line}");
         }
-        if meta_len > MAX_BYTES {
-            let _ = writeln!(term, "[truncated: {} bytes total]", meta_len);
+        if res.truncated {
+            let _ = writeln!(term, "[truncated: {} bytes total]", res.total_len);
         }
     }
 
-    fn cmd_tail(&self, args: &[&str], term: &mut Terminal) {
+    fn cmd_tail(&mut self, args: &[&str], term: &mut Terminal) {
         use fmt::Write as _;
 
         const MAX_BYTES: u64 = 1024 * 1024;
@@ -4137,34 +4779,42 @@ impl Shell {
             ["-n", n, path] => match n.parse::<usize>() {
                 Ok(v) => (v, *path),
                 Err(_) => {
-                    let _ = writeln!(term, "tail: bad -n: {n}");
+                    let msg = format!("tail: bad -n: {n}");
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     return;
                 }
             },
             _ => {
-                let _ = writeln!(term, "tail: expected: tail [-n N] <path>");
+                let msg = "tail: expected: tail [-n N] <path>".to_string();
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
                 return;
             }
         };
 
         let path = self.cwd.resolve(target);
         let host = path.to_host_path(&self.root_dir);
-        let file = match std::fs::File::open(&host) {
-            Ok(f) => f,
+        let res = match read_text_builtin_bytes(
+            &host,
+            target,
+            MAX_BYTES,
+            TEXT_BUILTIN_Z_MAX_COMPRESSED_BYTES,
+            TEXT_BUILTIN_Z_MAX_EXPANDED_BYTES,
+        ) {
+            Ok(v) => v,
             Err(err) => {
-                let _ = writeln!(term, "tail: {target}: {err}");
+                let msg = format!("tail: {target}: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
                 return;
             }
         };
-        let meta_len = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
-
-        use std::io::Read as _;
-        let mut buf = Vec::new();
-        if let Err(err) = file.take(MAX_BYTES).read_to_end(&mut buf) {
-            let _ = writeln!(term, "tail: {target}: {err}");
-            return;
+        if let Some(notice) = &res.notice {
+            let _ = writeln!(term, "{notice}");
         }
-        let text = String::from_utf8_lossy(&buf);
+
+        let (text, _) = decode_text_prefix(&res.bytes);
         let mut last: std::collections::VecDeque<&str> = std::collections::VecDeque::new();
         for line in text.lines() {
             if n == 0 {
@@ -4178,88 +4828,100 @@ impl Shell {
         for line in last {
             let _ = writeln!(term, "{line}");
         }
-        if meta_len > MAX_BYTES {
-            let _ = writeln!(term, "[truncated: {} bytes total]", meta_len);
+        if res.truncated {
+            let _ = writeln!(term, "[truncated: {} bytes total]", res.total_len);
         }
     }
 
-    fn cmd_wc(&self, args: &[&str], term: &mut Terminal) {
+    fn cmd_wc(&mut self, args: &[&str], term: &mut Terminal) {
         use fmt::Write as _;
 
         const MAX_BYTES: u64 = 1024 * 1024;
 
         let Some(target) = args.first().copied() else {
-            let _ = writeln!(term, "wc: expected: wc <path>");
+            let msg = "wc: expected: wc <path>".to_string();
+            let _ = writeln!(term, "{msg}");
+            self.set_last_error(msg);
             return;
         };
 
         let path = self.cwd.resolve(target);
         let host = path.to_host_path(&self.root_dir);
-        let file = match std::fs::File::open(&host) {
-            Ok(f) => f,
+        let res = match read_text_builtin_bytes(
+            &host,
+            target,
+            MAX_BYTES,
+            TEXT_BUILTIN_Z_MAX_COMPRESSED_BYTES,
+            TEXT_BUILTIN_Z_MAX_EXPANDED_BYTES,
+        ) {
+            Ok(v) => v,
             Err(err) => {
-                let _ = writeln!(term, "wc: {target}: {err}");
+                let msg = format!("wc: {target}: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
                 return;
             }
         };
-        let meta_len = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
+        let (text, cutoff) = decode_text_prefix(&res.bytes);
 
-        use std::io::Read as _;
-        let mut buf = Vec::new();
-        if let Err(err) = file.take(MAX_BYTES).read_to_end(&mut buf) {
-            let _ = writeln!(term, "wc: {target}: {err}");
-            return;
-        }
-        let text = String::from_utf8_lossy(&buf);
-
-        let bytes = buf.len();
+        let bytes = cutoff;
         let lines = text.lines().count();
         let words = text.split_whitespace().count();
         let _ = writeln!(term, "{lines}\t{words}\t{bytes}\t{target}");
-        if meta_len > MAX_BYTES {
-            let _ = writeln!(term, "[truncated: {} bytes total]", meta_len);
+        if res.truncated {
+            let _ = writeln!(term, "[truncated: {} bytes total]", res.total_len);
+        }
+        if let Some(notice) = &res.notice {
+            let _ = writeln!(term, "{notice}");
         }
     }
 
-    fn cmd_more(&self, args: &[&str], term: &mut Terminal) {
+    fn cmd_more(&mut self, args: &[&str], term: &mut Terminal) {
         use fmt::Write as _;
 
         const MAX_BYTES: u64 = 4 * 1024 * 1024;
 
         let Some(target) = args.first().copied() else {
-            let _ = writeln!(term, "more: expected: more <path>");
+            let msg = "more: expected: more <path>".to_string();
+            let _ = writeln!(term, "{msg}");
+            self.set_last_error(msg);
             return;
         };
 
         let path = self.cwd.resolve(target);
         let host = path.to_host_path(&self.root_dir);
-        let file = match std::fs::File::open(&host) {
-            Ok(f) => f,
-            Err(err) => {
-                let _ = writeln!(term, "more: {target}: {err}");
-                return;
-            }
-        };
-        let meta_len = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
 
         term.clear_output();
         let _ = writeln!(term, "[more] {target}  (PgUp/PgDn scroll, Ctrl+End bottom)");
         let _ = writeln!(term, "");
 
-        use std::io::Read as _;
-        let mut buf = Vec::new();
-        if let Err(err) = file.take(MAX_BYTES).read_to_end(&mut buf) {
-            let _ = writeln!(term, "more: {target}: {err}");
-            return;
+        let res = match read_text_builtin_bytes(
+            &host,
+            target,
+            MAX_BYTES,
+            TEXT_BUILTIN_Z_MAX_COMPRESSED_BYTES,
+            TEXT_BUILTIN_Z_MAX_EXPANDED_BYTES,
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                let msg = format!("more: {target}: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
+                return;
+            }
+        };
+        if let Some(notice) = &res.notice {
+            let _ = writeln!(term, "{notice}");
+            let _ = writeln!(term, "");
         }
 
-        let text = String::from_utf8_lossy(&buf);
+        let (text, _) = decode_text_prefix(&res.bytes);
         let _ = write!(term, "{text}");
         if !text.ends_with('\n') {
             let _ = writeln!(term, "");
         }
-        if meta_len > MAX_BYTES {
-            let _ = writeln!(term, "[truncated: {} bytes total]", meta_len);
+        if res.truncated {
+            let _ = writeln!(term, "[truncated: {} bytes total]", res.total_len);
         }
 
         term.scroll_view_to_top();
@@ -4286,21 +4948,29 @@ impl Shell {
                     }
                 }
                 Err(err) => {
-                    let _ = writeln!(term, "clip: get: {err}");
+                    let msg = format!("clip: get: {err}");
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                 }
             },
             "set" => {
                 let Some(rest) = line.strip_prefix("clip") else {
-                    let _ = writeln!(term, "clip: internal parse error");
+                    let msg = "clip: internal parse error".to_string();
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     return;
                 };
                 let Some(rest) = rest.trim_start().strip_prefix("set") else {
-                    let _ = writeln!(term, "clip: internal parse error");
+                    let msg = "clip: internal parse error".to_string();
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     return;
                 };
                 let text = rest.trim_start();
                 if text.is_empty() {
-                    let _ = writeln!(term, "clip: set: missing text");
+                    let msg = "clip: set: missing text".to_string();
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     return;
                 }
                 match self.clipboard.set_text(text) {
@@ -4308,7 +4978,9 @@ impl Shell {
                         let _ = writeln!(term, "[clipboard set: {} bytes]", text.len());
                     }
                     Err(err) => {
-                        let _ = writeln!(term, "clip: set: {err}");
+                        let msg = format!("clip: set: {err}");
+                        let _ = writeln!(term, "{msg}");
+                        self.set_last_error(msg);
                     }
                 }
             }
@@ -4317,7 +4989,9 @@ impl Shell {
                     let _ = writeln!(term, "[clipboard cleared]");
                 }
                 Err(err) => {
-                    let _ = writeln!(term, "clip: clear: {err}");
+                    let msg = format!("clip: clear: {err}");
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                 }
             },
             "help" | "-h" | "--help" => {
@@ -4327,7 +5001,9 @@ impl Shell {
                 let _ = writeln!(term, "hotkey: Ctrl+V (or Shift+Ins) to paste");
             }
             other => {
-                let _ = writeln!(term, "clip: unknown subcommand: {other}");
+                let msg = format!("clip: unknown subcommand: {other}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
                 let _ = writeln!(term, "clip help");
             }
         }
@@ -4379,7 +5055,9 @@ impl Shell {
         };
 
         if name.is_empty() {
-            let _ = writeln!(term, "set: missing name");
+            let msg = "set: missing name".to_string();
+            let _ = writeln!(term, "{msg}");
+            self.set_last_error(msg);
             return;
         }
 
@@ -4395,10 +5073,63 @@ impl Shell {
         let _ = writeln!(term, "[cleared {name}]");
     }
 
-    fn cmd_open(&self, args: &[&str], term: &mut Terminal) {
+    fn cmd_notifs(&mut self, args: &[&str], term: &mut Terminal) {
+        use fmt::Write as _;
+
+        let sub = args.first().copied().unwrap_or("");
+        match sub {
+            "" => {}
+            "help" | "-h" | "--help" => {
+                let _ = writeln!(term, "notifs");
+                let _ = writeln!(term, "notifs <n>");
+                let _ = writeln!(term, "notifs clear");
+                return;
+            }
+            "clear" | "clr" | "-c" => {
+                self.clear_notifications();
+                let _ = writeln!(term, "[notifications cleared]");
+                return;
+            }
+            other => {
+                if other.parse::<usize>().is_err() {
+                    let msg = format!("notifs: unknown subcommand: {other}");
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
+                    let _ = writeln!(term, "notifs help");
+                    return;
+                }
+            }
+        }
+
+        if self.notifications.is_empty() {
+            let _ = writeln!(term, "(no notifications)");
+            return;
+        }
+
+        let limit = sub.parse::<usize>().ok();
+        let stored = self.notifications.len();
+        let to_show = limit.unwrap_or(stored).min(stored);
+        let start = stored.saturating_sub(to_show);
+
+        let _ = writeln!(term, "Notifications (showing {to_show}/{stored}):");
+        for entry in self.notifications.iter().skip(start) {
+            let _ = writeln!(
+                term,
+                "  {} {} {}",
+                entry.time_hms,
+                entry.level.as_str(),
+                entry.msg
+            );
+        }
+        let _ = writeln!(term, "Tip: notifs clear");
+    }
+
+    fn cmd_open(&mut self, args: &[&str], term: &mut Terminal) {
         let Some(target) = args.first().copied() else {
             use fmt::Write as _;
-            let _ = writeln!(term, "open: missing path");
+            let msg = "open: missing path".to_string();
+            let _ = writeln!(term, "{msg}");
+            self.set_last_error(msg);
             return;
         };
 
@@ -4416,15 +5147,19 @@ impl Shell {
                 if switched {
                     self.maybe_auto_temple_ws(term);
                 }
-                let _ = writeln!(term, "open: xdg-open: {err}");
+                let msg = format!("open: xdg-open: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
             }
         }
     }
 
-    fn cmd_browse(&self, args: &[&str], term: &mut Terminal) {
+    fn cmd_browse(&mut self, args: &[&str], term: &mut Terminal) {
         let Some(url) = args.first().copied() else {
             use fmt::Write as _;
-            let _ = writeln!(term, "browse: missing url");
+            let msg = "browse: missing url".to_string();
+            let _ = writeln!(term, "{msg}");
+            self.set_last_error(msg);
             return;
         };
 
@@ -4440,19 +5175,23 @@ impl Shell {
                 if switched {
                     self.maybe_auto_temple_ws(term);
                 }
-                let _ = writeln!(term, "browse: xdg-open: {err}");
+                let msg = format!("browse: xdg-open: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
             }
         }
     }
 
-    fn cmd_ws(&self, args: &[&str], term: &mut Terminal) {
+    fn cmd_ws(&mut self, args: &[&str], term: &mut Terminal) {
         use fmt::Write as _;
 
         let temple_ws = self.env_u32("TEMPLE_WS_TEMPLE", 1);
         let linux_ws = self.env_u32("TEMPLE_WS_LINUX", 2);
 
         let Some(target) = args.first().copied() else {
-            let _ = writeln!(term, "ws <temple|linux|num>");
+            let msg = "ws <temple|linux|num>".to_string();
+            let _ = writeln!(term, "{msg}");
+            self.set_last_error(msg);
             let _ = writeln!(
                 term,
                 "ws: TEMPLE_WS_TEMPLE={temple_ws} TEMPLE_WS_LINUX={linux_ws} TEMPLE_AUTO_LINUX_WS={}",
@@ -4468,7 +5207,9 @@ impl Shell {
             other => match other.parse::<u32>() {
                 Ok(n) => n,
                 Err(_) => {
-                    let _ = writeln!(term, "ws: expected temple|linux|num, got: {other}");
+                    let msg = format!("ws: expected temple|linux|num, got: {other}");
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     return;
                 }
             },
@@ -4479,12 +5220,14 @@ impl Shell {
                 let _ = writeln!(term, "ws: switched to workspace {number}");
             }
             Err(err) => {
-                let _ = writeln!(term, "ws: {err}");
+                let msg = format!("ws: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
             }
         }
     }
 
-    fn maybe_auto_linux_ws(&self, term: &mut Terminal) -> bool {
+    fn maybe_auto_linux_ws(&mut self, term: &mut Terminal) -> bool {
         if !self.env_bool("TEMPLE_AUTO_LINUX_WS") {
             return false;
         }
@@ -4493,20 +5236,24 @@ impl Shell {
             Ok(()) => true,
             Err(err) => {
                 use fmt::Write as _;
-                let _ = writeln!(term, "ws: {err}");
+                let msg = format!("ws: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
                 false
             }
         }
     }
 
-    fn maybe_auto_temple_ws(&self, term: &mut Terminal) {
+    fn maybe_auto_temple_ws(&mut self, term: &mut Terminal) {
         if !self.env_bool("TEMPLE_AUTO_LINUX_WS") {
             return;
         }
         let temple_ws = self.env_u32("TEMPLE_WS_TEMPLE", 1);
         if let Err(err) = self.sway_workspace_number(temple_ws) {
             use fmt::Write as _;
-            let _ = writeln!(term, "ws: {err}");
+            let msg = format!("ws: {err}");
+            let _ = writeln!(term, "{msg}");
+            self.set_last_error(msg);
         }
     }
 
@@ -4566,10 +5313,12 @@ impl Shell {
         Err(msg)
     }
 
-    fn cmd_run(&self, args: &[&str], term: &mut Terminal) {
+    fn cmd_run(&mut self, args: &[&str], term: &mut Terminal) {
         let Some(program) = args.first().copied() else {
             use fmt::Write as _;
-            let _ = writeln!(term, "run: missing command");
+            let msg = "run: missing command".to_string();
+            let _ = writeln!(term, "{msg}");
+            self.set_last_error(msg);
             return;
         };
 
@@ -4589,7 +5338,9 @@ impl Shell {
                 if switched {
                     self.maybe_auto_temple_ws(term);
                 }
-                let _ = writeln!(term, "run: {program}: {err}");
+                let msg = format!("run: {program}: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
             }
         }
     }
@@ -4598,7 +5349,9 @@ impl Shell {
         use fmt::Write as _;
 
         if !args.is_empty() {
-            let _ = writeln!(term, "shutdown: takes no args");
+            let msg = "shutdown: takes no args".to_string();
+            let _ = writeln!(term, "{msg}");
+            self.set_last_error(msg);
             return;
         }
 
@@ -4610,7 +5363,9 @@ impl Shell {
         use fmt::Write as _;
 
         if args.len() > 1 {
-            let _ = writeln!(term, "screenshot: expected: screenshot [path.png]");
+            let msg = "screenshot: expected: screenshot [path.png]".to_string();
+            let _ = writeln!(term, "{msg}");
+            self.set_last_error(msg);
             return;
         }
 
@@ -4630,7 +5385,9 @@ impl Shell {
         let host_path = temple_path.to_host_path(&self.root_dir);
         if let Some(parent) = host_path.parent() {
             if let Err(err) = std::fs::create_dir_all(parent) {
-                let _ = writeln!(term, "screenshot: {}: {err}", temple_path.display());
+                let msg = format!("screenshot: {}: {err}", temple_path.display());
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
                 return;
             }
         }
@@ -4644,7 +5401,9 @@ impl Shell {
         match args.split_first() {
             Some((&"tree", rest)) => {
                 if !rest.is_empty() {
-                    let _ = writeln!(term, "tapp: tree takes no args");
+                    let msg = "tapp: tree takes no args".to_string();
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     return;
                 }
 
@@ -4653,7 +5412,9 @@ impl Shell {
                         let _ = writeln!(term, "TempleOS tree: {}", root.display());
                     }
                     None => {
-                        let _ = writeln!(term, "TempleOS tree: (not found)");
+                        let msg = "TempleOS tree: (not found)".to_string();
+                        let _ = writeln!(term, "{msg}");
+                        self.set_last_error(msg);
                         let _ = writeln!(
                             term,
                             "Hint: ensure third_party/TempleOS is near the binary, or set TEMPLEOS_ROOT."
@@ -4665,12 +5426,16 @@ impl Shell {
             Some((&"search", rest)) => {
                 let query = rest.join(" ");
                 if query.trim().is_empty() {
-                    let _ = writeln!(term, "tapp: expected: tapp search <text>");
+                    let msg = "tapp: expected: tapp search <text>".to_string();
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     return;
                 }
 
                 let Some(root) = discover_templeos_root() else {
-                    let _ = writeln!(term, "tapp: TempleOS tree not found.");
+                    let msg = "tapp: TempleOS tree not found.".to_string();
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     let _ = writeln!(
                         term,
                         "Hint: ensure third_party/TempleOS is near the binary, or set TEMPLEOS_ROOT."
@@ -4702,7 +5467,9 @@ impl Shell {
             Some((&"run", rest)) => {
                 let query = rest.join(" ");
                 if query.trim().is_empty() {
-                    let _ = writeln!(term, "tapp: expected: tapp run <alias|path>");
+                    let msg = "tapp: expected: tapp run <alias|path>".to_string();
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     let _ = writeln!(term, "Example: tapp run Print");
                     let _ = writeln!(term, "Example: tapp run Demo/Graphics/NetOfDots");
                     let _ = writeln!(term, "Example: tapp run ::/Demo/PullDownMenu.HC");
@@ -4710,7 +5477,9 @@ impl Shell {
                 }
 
                 let Some(root) = discover_templeos_root() else {
-                    let _ = writeln!(term, "tapp: TempleOS tree not found.");
+                    let msg = "tapp: TempleOS tree not found.".to_string();
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     let _ = writeln!(
                         term,
                         "Hint: ensure third_party/TempleOS is near the binary, or set TEMPLEOS_ROOT."
@@ -4725,7 +5494,9 @@ impl Shell {
                         self.cmd_tapp(&["hc", spec_owned.as_str()], term);
                     }
                     Err(err) => {
-                        let _ = writeln!(term, "tapp: run: {err}");
+                        let msg = format!("tapp: run: {err}");
+                        let _ = writeln!(term, "{msg}");
+                        self.set_last_error(msg);
                     }
                 }
                 return;
@@ -4757,7 +5528,9 @@ impl Shell {
                             let _ = writeln!(term, "tapp: child pid {}", child.id());
                         }
                         Err(err) => {
-                            let _ = writeln!(term, "tapp: child status: {err}");
+                            let msg = format!("tapp: child status: {err}");
+                            let _ = writeln!(term, "{msg}");
+                            self.set_last_error(msg);
                         }
                     }
                 } else {
@@ -4774,6 +5547,8 @@ impl Shell {
                 let _ = writeln!(term, "  tapp demo                 Graphics demo app");
                 let _ = writeln!(term, "  tapp paint                Pixel paint app");
                 let _ = writeln!(term, "  tapp linuxbridge           Linux integration app");
+                let _ = writeln!(term, "  tapp clipboardbridge       Host clipboard helper app");
+                let _ = writeln!(term, "  tapp filebridge            Copy files to/from host");
                 let _ = writeln!(term, "  tapp timeclock             TimeClock wrapper app");
                 let _ = writeln!(term, "  tapp sounddemo             Sound output demo");
                 let _ = writeln!(term, "  tapp logic                 Digital logic app (upstream)");
@@ -4789,7 +5564,9 @@ impl Shell {
                 let _ = writeln!(term, "");
 
                 let Some(root) = discover_templeos_root() else {
-                    let _ = writeln!(term, "TempleOS tree: (not found)");
+                    let msg = "TempleOS tree: (not found)".to_string();
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     let _ = writeln!(
                         term,
                         "Hint: ensure third_party/TempleOS is near the binary, or set TEMPLEOS_ROOT."
@@ -4808,27 +5585,29 @@ impl Shell {
                 return;
             }
             Some((&"kill", _)) => {
-                if let Some(child) = self.tapp_child.as_mut() {
+                if let Some(mut child) = self.tapp_child.take() {
                     match child.try_wait() {
                         Ok(Some(status)) => {
                             let _ = writeln!(term, "tapp: already exited: {status}");
-                            self.tapp_child = None;
                             self.tapp_connected = false;
                             return;
                         }
                         Ok(None) => {}
                         Err(err) => {
-                            let _ = writeln!(term, "tapp: child status: {err}");
+                            let msg = format!("tapp: child status: {err}");
+                            let _ = writeln!(term, "{msg}");
+                            self.set_last_error(msg);
                         }
                     }
 
                     if let Err(err) = child.kill() {
-                        let _ = writeln!(term, "tapp: kill: {err}");
+                        let msg = format!("tapp: kill: {err}");
+                        let _ = writeln!(term, "{msg}");
+                        self.set_last_error(msg);
                     } else {
                         let _ = writeln!(term, "tapp: kill: sent");
                     }
                     let _ = child.wait();
-                    self.tapp_child = None;
                     self.tapp_connected = false;
                     return;
                 }
@@ -4843,7 +5622,9 @@ impl Shell {
             }
             Some((&"restart", rest)) => {
                 if !rest.is_empty() {
-                    let _ = writeln!(term, "tapp: restart takes no args");
+                    let msg = "tapp: restart takes no args".to_string();
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     return;
                 }
                 // Best-effort: kill tracked child first.
@@ -4866,7 +5647,9 @@ impl Shell {
         let sock = match std::env::var("TEMPLE_SOCK") {
             Ok(v) => v,
             Err(_) => {
-                let _ = writeln!(term, "tapp: TEMPLE_SOCK is not set");
+                let msg = "tapp: TEMPLE_SOCK is not set".to_string();
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
                 return;
             }
         };
@@ -4915,10 +5698,12 @@ impl Shell {
                 .unwrap_or_else(|| "temple-edit".to_string())
         };
 
-        if let Some((&sub, rest)) = args.split_first() {
+            if let Some((&sub, rest)) = args.split_first() {
             if sub == "linuxbridge" || sub == "bridge" {
                 if !rest.is_empty() {
-                    let _ = writeln!(term, "tapp: {sub} takes no args");
+                    let msg = format!("tapp: {sub} takes no args");
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     return;
                 }
 
@@ -4934,6 +5719,10 @@ impl Shell {
                         "tapp: linuxbridge: failed to create {}",
                         linuxbridge_path.display()
                     );
+                    self.set_last_error(format!(
+                        "tapp: linuxbridge: failed to create {}",
+                        linuxbridge_path.display()
+                    ));
                     return;
                 }
 
@@ -4965,7 +5754,135 @@ impl Shell {
                         let _ = writeln!(term, "tapp: launched pid {pid}");
                     }
                     Err(err) => {
-                        let _ = writeln!(term, "tapp: {program}: {err}");
+                        let msg = format!("tapp: {program}: {err}");
+                        let _ = writeln!(term, "{msg}");
+                        self.set_last_error(msg);
+                    }
+                }
+                return;
+            }
+
+            if sub == "clipboardbridge" || sub == "clipboard" || sub == "clipbridge" {
+                if !rest.is_empty() {
+                    let msg = format!("tapp: {sub} takes no args");
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
+                    return;
+                }
+
+                let apps_dir = self.root_dir.join("Apps");
+                let _ = std::fs::create_dir_all(&apps_dir);
+                let clipboardbridge_path = apps_dir.join("ClipboardBridge.HC");
+                if !clipboardbridge_path.exists() {
+                    let _ = std::fs::write(&clipboardbridge_path, TEMPLELINUX_CLIPBOARDBRIDGE_HC);
+                }
+                if !clipboardbridge_path.exists() {
+                    let _ = writeln!(
+                        term,
+                        "tapp: clipboardbridge: failed to create {}",
+                        clipboardbridge_path.display()
+                    );
+                    self.set_last_error(format!(
+                        "tapp: clipboardbridge: failed to create {}",
+                        clipboardbridge_path.display()
+                    ));
+                    return;
+                }
+
+                let host_path_str = clipboardbridge_path.to_string_lossy().to_string();
+                let host_cwd = self.cwd.to_host_path(&self.root_dir);
+
+                let program = hc_program();
+                let mut cmd = std::process::Command::new(&program);
+                cmd.arg(&host_path_str);
+                for (k, v) in &self.vars {
+                    cmd.env(k, v);
+                }
+                cmd.env("TEMPLE_SOCK", &sock)
+                    .env("TEMPLE_ROOT", self.root_dir.as_os_str())
+                    .current_dir(host_cwd);
+                if let Some(root) = discover_templeos_root() {
+                    cmd.env("TEMPLEOS_ROOT", root.as_os_str());
+                }
+
+                match cmd.spawn() {
+                    Ok(child) => {
+                        self.queue_window_title("ClipboardBridge".to_string());
+                        self.tapp_last = Some(TappLaunch {
+                            program: "clipboardbridge".to_string(),
+                            args: Vec::new(),
+                        });
+                        self.tapp_child = Some(child);
+                        let pid = self.tapp_child.as_ref().map(|c| c.id()).unwrap_or(0);
+                        let _ = writeln!(term, "tapp: launched pid {pid}");
+                    }
+                    Err(err) => {
+                        let msg = format!("tapp: {program}: {err}");
+                        let _ = writeln!(term, "{msg}");
+                        self.set_last_error(msg);
+                    }
+                }
+                return;
+            }
+
+            if sub == "filebridge" || sub == "fbridge" {
+                if !rest.is_empty() {
+                    let msg = format!("tapp: {sub} takes no args");
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
+                    return;
+                }
+
+                let apps_dir = self.root_dir.join("Apps");
+                let _ = std::fs::create_dir_all(&apps_dir);
+                let filebridge_path = apps_dir.join("FileBridge.HC");
+                if !filebridge_path.exists() {
+                    let _ = std::fs::write(&filebridge_path, TEMPLELINUX_FILEBRIDGE_HC);
+                }
+                if !filebridge_path.exists() {
+                    let _ = writeln!(
+                        term,
+                        "tapp: filebridge: failed to create {}",
+                        filebridge_path.display()
+                    );
+                    self.set_last_error(format!(
+                        "tapp: filebridge: failed to create {}",
+                        filebridge_path.display()
+                    ));
+                    return;
+                }
+
+                let host_path_str = filebridge_path.to_string_lossy().to_string();
+                let host_cwd = self.cwd.to_host_path(&self.root_dir);
+
+                let program = hc_program();
+                let mut cmd = std::process::Command::new(&program);
+                cmd.arg(&host_path_str);
+                for (k, v) in &self.vars {
+                    cmd.env(k, v);
+                }
+                cmd.env("TEMPLE_SOCK", &sock)
+                    .env("TEMPLE_ROOT", self.root_dir.as_os_str())
+                    .current_dir(host_cwd);
+                if let Some(root) = discover_templeos_root() {
+                    cmd.env("TEMPLEOS_ROOT", root.as_os_str());
+                }
+
+                match cmd.spawn() {
+                    Ok(child) => {
+                        self.queue_window_title("FileBridge".to_string());
+                        self.tapp_last = Some(TappLaunch {
+                            program: "filebridge".to_string(),
+                            args: Vec::new(),
+                        });
+                        self.tapp_child = Some(child);
+                        let pid = self.tapp_child.as_ref().map(|c| c.id()).unwrap_or(0);
+                        let _ = writeln!(term, "tapp: launched pid {pid}");
+                    }
+                    Err(err) => {
+                        let msg = format!("tapp: {program}: {err}");
+                        let _ = writeln!(term, "{msg}");
+                        self.set_last_error(msg);
                     }
                 }
                 return;
@@ -4973,7 +5890,9 @@ impl Shell {
 
             if sub == "timeclock" || sub == "clock" {
                 if !rest.is_empty() {
-                    let _ = writeln!(term, "tapp: {sub} takes no args");
+                    let msg = format!("tapp: {sub} takes no args");
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     return;
                 }
 
@@ -4989,6 +5908,10 @@ impl Shell {
                         "tapp: timeclock: failed to create {}",
                         timeclock_path.display()
                     );
+                    self.set_last_error(format!(
+                        "tapp: timeclock: failed to create {}",
+                        timeclock_path.display()
+                    ));
                     return;
                 }
 
@@ -5020,7 +5943,9 @@ impl Shell {
                         let _ = writeln!(term, "tapp: launched pid {pid}");
                     }
                     Err(err) => {
-                        let _ = writeln!(term, "tapp: {program}: {err}");
+                        let msg = format!("tapp: {program}: {err}");
+                        let _ = writeln!(term, "{msg}");
+                        self.set_last_error(msg);
                     }
                 }
                 return;
@@ -5028,7 +5953,9 @@ impl Shell {
 
             if sub == "sounddemo" || sub == "sound" || sub == "snddemo" {
                 if !rest.is_empty() {
-                    let _ = writeln!(term, "tapp: {sub} takes no args");
+                    let msg = format!("tapp: {sub} takes no args");
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     return;
                 }
 
@@ -5044,6 +5971,10 @@ impl Shell {
                         "tapp: sounddemo: failed to create {}",
                         sounddemo_path.display()
                     );
+                    self.set_last_error(format!(
+                        "tapp: sounddemo: failed to create {}",
+                        sounddemo_path.display()
+                    ));
                     return;
                 }
 
@@ -5075,7 +6006,9 @@ impl Shell {
                         let _ = writeln!(term, "tapp: launched pid {pid}");
                     }
                     Err(err) => {
-                        let _ = writeln!(term, "tapp: {program}: {err}");
+                        let msg = format!("tapp: {program}: {err}");
+                        let _ = writeln!(term, "{msg}");
+                        self.set_last_error(msg);
                     }
                 }
                 return;
@@ -5083,7 +6016,9 @@ impl Shell {
 
             if sub == "logic" {
                 if !rest.is_empty() {
-                    let _ = writeln!(term, "tapp: {sub} takes no args");
+                    let msg = format!("tapp: {sub} takes no args");
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     return;
                 }
 
@@ -5113,7 +6048,9 @@ impl Shell {
                         let _ = writeln!(term, "tapp: launched pid {pid}");
                     }
                     Err(err) => {
-                        let _ = writeln!(term, "tapp: {program}: {err}");
+                        let msg = format!("tapp: {program}: {err}");
+                        let _ = writeln!(term, "{msg}");
+                        self.set_last_error(msg);
                     }
                 }
                 return;
@@ -5121,7 +6058,9 @@ impl Shell {
 
             if sub == "keepaway" || sub == "ka" {
                 if !rest.is_empty() {
-                    let _ = writeln!(term, "tapp: {sub} takes no args");
+                    let msg = format!("tapp: {sub} takes no args");
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     return;
                 }
 
@@ -5151,7 +6090,9 @@ impl Shell {
                         let _ = writeln!(term, "tapp: launched pid {pid}");
                     }
                     Err(err) => {
-                        let _ = writeln!(term, "tapp: {program}: {err}");
+                        let msg = format!("tapp: {program}: {err}");
+                        let _ = writeln!(term, "{msg}");
+                        self.set_last_error(msg);
                     }
                 }
                 return;
@@ -5159,7 +6100,9 @@ impl Shell {
 
             if sub == "wallpaperctrl" || sub == "wallctrl" {
                 if !rest.is_empty() {
-                    let _ = writeln!(term, "tapp: {sub} takes no args");
+                    let msg = format!("tapp: {sub} takes no args");
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     return;
                 }
 
@@ -5175,6 +6118,10 @@ impl Shell {
                         "tapp: wallpaperctrl: failed to create {}",
                         wallctrl_path.display()
                     );
+                    self.set_last_error(format!(
+                        "tapp: wallpaperctrl: failed to create {}",
+                        wallctrl_path.display()
+                    ));
                     return;
                 }
 
@@ -5206,7 +6153,9 @@ impl Shell {
                         let _ = writeln!(term, "tapp: launched pid {pid}");
                     }
                     Err(err) => {
-                        let _ = writeln!(term, "tapp: {program}: {err}");
+                        let msg = format!("tapp: {program}: {err}");
+                        let _ = writeln!(term, "{msg}");
+                        self.set_last_error(msg);
                     }
                 }
                 return;
@@ -5214,7 +6163,9 @@ impl Shell {
 
             if sub == "wallpaperfish" || sub == "wallfish" {
                 if !rest.is_empty() {
-                    let _ = writeln!(term, "tapp: {sub} takes no args");
+                    let msg = format!("tapp: {sub} takes no args");
+                    let _ = writeln!(term, "{msg}");
+                    self.set_last_error(msg);
                     return;
                 }
 
@@ -5230,6 +6181,10 @@ impl Shell {
                         "tapp: wallpaperfish: failed to create {}",
                         wallfish_path.display()
                     );
+                    self.set_last_error(format!(
+                        "tapp: wallpaperfish: failed to create {}",
+                        wallfish_path.display()
+                    ));
                     return;
                 }
 
@@ -5261,7 +6216,9 @@ impl Shell {
                         let _ = writeln!(term, "tapp: launched pid {pid}");
                     }
                     Err(err) => {
-                        let _ = writeln!(term, "tapp: {program}: {err}");
+                        let msg = format!("tapp: {program}: {err}");
+                        let _ = writeln!(term, "{msg}");
+                        self.set_last_error(msg);
                     }
                 }
                 return;
@@ -5323,7 +6280,9 @@ impl Shell {
                 let _ = writeln!(term, "tapp: launched pid {pid}");
             }
             Err(err) => {
-                let _ = writeln!(term, "tapp: {program}: {err}");
+                let msg = format!("tapp: {program}: {err}");
+                let _ = writeln!(term, "{msg}");
+                self.set_last_error(msg);
             }
         }
     }
@@ -5371,4 +6330,147 @@ impl Shell {
 
         self.cmd_tapp(&["edit", host_str.as_str()], term);
     }
+}
+
+fn psalmody_note2ona(note: i64, octave: i64) -> Option<u8> {
+    // TempleOS: Mid C is ona=51, note=3, octave=4.
+    let ona = if note < 3 {
+        (octave + 1) * 12 + note
+    } else {
+        octave * 12 + note
+    };
+    if !(0..=127).contains(&ona) {
+        return None;
+    }
+    Some(ona as u8)
+}
+
+fn psalmody_sleep_with_stop(
+    secs: f64,
+    stop: &std::sync::atomic::AtomicBool,
+) -> bool {
+    if secs.is_nan() || secs <= 0.0 {
+        return !stop.load(std::sync::atomic::Ordering::Relaxed);
+    }
+
+    let mut remaining = secs;
+    while remaining > 0.0 {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        let chunk = remaining.min(0.02);
+        std::thread::sleep(std::time::Duration::from_secs_f64(chunk));
+        remaining -= chunk;
+    }
+    true
+}
+
+fn psalmody_play_song(song: &str, audio: audio::Audio, stop: Arc<std::sync::atomic::AtomicBool>) {
+    const NOTE_MAP: [i64; 7] = [0, 2, 3, 5, 7, 8, 10];
+
+    // TempleOS defaults per `MusicSettingsRst`.
+    let mut octave: i64 = 4;
+    let mut note_len: f64 = 1.0;
+    let tempo: f64 = 2.5;
+    let staccatto_factor: f64 = 0.9;
+
+    let st = song.as_bytes();
+    let mut i: usize = 0;
+    while i < st.len() && !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut tie = false;
+
+        loop {
+            let before = i;
+            if st.get(i) == Some(&b'(') {
+                tie = true;
+                i += 1;
+            } else {
+                // Meter (M4/4 etc). Parsed for compatibility; meter doesn't currently affect playback.
+                while st.get(i) == Some(&b'M') {
+                    i += 1;
+                    if st.get(i).is_some_and(|c| c.is_ascii_digit()) {
+                        i += 1;
+                    }
+                    if st.get(i) == Some(&b'/') {
+                        i += 1;
+                    }
+                    if st.get(i).is_some_and(|c| c.is_ascii_digit()) {
+                        i += 1;
+                    }
+                }
+
+                // Octave digit(s).
+                while st.get(i).is_some_and(|c| c.is_ascii_digit()) {
+                    octave = (st[i] - b'0') as i64;
+                    i += 1;
+                }
+
+                // Note length modifiers.
+                loop {
+                    let Some(&ch) = st.get(i) else { break };
+                    match ch {
+                        b'w' => note_len = 4.0,
+                        b'h' => note_len = 2.0,
+                        b'q' => note_len = 1.0,
+                        b'e' => note_len = 0.5,
+                        b's' => note_len = 0.25,
+                        b't' => note_len = 2.0 * note_len / 3.0,
+                        b'.' => note_len = 1.5 * note_len,
+                        _ => break,
+                    }
+                    i += 1;
+                }
+            }
+            if i == before {
+                break;
+            }
+        }
+
+        let Some(&note_ch) = st.get(i) else { break };
+        i += 1;
+
+        let mut ona: u8 = 0;
+        if (b'A'..=b'G').contains(&note_ch) {
+            let note_idx = (note_ch - b'A') as usize;
+            let mut note = NOTE_MAP[note_idx];
+            let mut note_octave = octave;
+
+            if st.get(i) == Some(&b'b') {
+                note -= 1;
+                if note == 2 {
+                    note_octave -= 1;
+                }
+                i += 1;
+            } else if st.get(i) == Some(&b'#') {
+                note += 1;
+                if note == 3 {
+                    note_octave += 1;
+                }
+                i += 1;
+            }
+
+            ona = psalmody_note2ona(note, note_octave).unwrap_or(0);
+        }
+
+        let d = if tempo > 0.0 { note_len / tempo } else { 0.0 };
+        let (on, off) = if tie {
+            (d, 0.0)
+        } else {
+            (d * staccatto_factor, d * (1.0 - staccatto_factor))
+        };
+
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        audio.snd(ona);
+        if !psalmody_sleep_with_stop(on, &stop) {
+            break;
+        }
+        audio.snd(0);
+        if !psalmody_sleep_with_stop(off, &stop) {
+            break;
+        }
+    }
+
+    audio.snd(0);
 }

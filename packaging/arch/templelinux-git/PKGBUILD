@@ -25,6 +25,8 @@ makedepends=(
 optdepends=(
   'sway: dedicated TempleLinux session (workspace 1 Temple, workspace 2 Linux)'
   'xorg-xwayland: run X11 apps in the dedicated session'
+  'weston: headless Wayland compositor for GUI smoke tests (packaging/bin/templelinux-gui-smoke-wayland)'
+  'xorg-server-xvfb: xvfb-run for headless GUI golden tests (TEMPLE_GUI_TESTS=1 cargo test --test gui_smoke)'
 )
 provides=('templelinux')
 conflicts=('templelinux')

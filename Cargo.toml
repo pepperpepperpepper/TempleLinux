@@ -22,6 +22,10 @@ path = "src/bin/temple_paint.rs"
 name = "temple-edit"
 path = "src/bin/temple_edit.rs"
 
+[[bin]]
+name = "temple-bridge-helper"
+path = "src/bin/temple_bridge_helper.rs"
+
 [dependencies]
 arboard = "3.6.1"
 bytemuck = { version = "1.14", features = ["derive"] }

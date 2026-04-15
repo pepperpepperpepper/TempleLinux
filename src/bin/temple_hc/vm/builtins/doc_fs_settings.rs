@@ -670,8 +670,16 @@ impl Vm {
                     return Err("ClipPutS(\"text\") expects 1 arg".to_string());
                 }
                 let v = self.eval_expr(&args[0])?;
-                let Value::Str(text) = v else {
-                    return Err("ClipPutS expects a string".to_string());
+                let text = match v {
+                    Value::Str(text) => text,
+                    Value::Int(0) => String::new(),
+                    Value::Int(ptr) => self.read_cstr_lossy(ptr)?,
+                    Value::Ptr { addr, .. } => self.read_cstr_lossy(addr)?,
+                    other => {
+                        return Err(format!(
+                            "ClipPutS expects a string or pointer, got {other:?}"
+                        ));
+                    }
                 };
                 self.rt
                     .clipboard_set_text(&text)

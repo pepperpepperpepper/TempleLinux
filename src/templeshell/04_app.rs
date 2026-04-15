@@ -190,12 +190,13 @@ impl App {
         output_size: PhysicalSize<u32>,
         temple_sock: Option<PathBuf>,
         test: Option<TestState>,
+        audio: audio::Audio,
     ) -> Self {
         let palette = assets::TEMPLEOS_GR_PALETTE_STD_RGBA256;
         let fb = Framebuffer::new();
         let fb_rgba = vec![0; (INTERNAL_W * INTERNAL_H * 4) as usize];
         let mut terminal = Terminal::new(COLOR_FG, COLOR_BG, OUTPUT_ROWS);
-        let shell = Shell::new(test.is_some());
+        let shell = Shell::new(test.is_some(), audio);
 
         use fmt::Write as _;
         writeln!(&mut terminal, "TempleShell").ok();
@@ -460,11 +461,39 @@ impl App {
     }
 
     fn send_app_msg(&mut self, id: AppId, msg: protocol::Msg) -> bool {
+        let known = self.temple_apps.contains_key(&id)
+            || self.windows.iter().any(|w| w.id == id)
+            || self.wallpaper_app == Some(id);
+        let expected_disconnect = self.shutdown_started
+            || self
+                .windows
+                .iter()
+                .find(|w| w.id == id)
+                .is_some_and(|w| w.closing);
+
         let failed = match self.temple_apps.get(&id) {
             Some(sess) => sess.cmd_tx.send(msg).is_err(),
             None => true,
         };
         if failed {
+            if known && !expected_disconnect {
+                let title = self
+                    .windows
+                    .iter()
+                    .find(|w| w.id == id)
+                    .map(|w| w.title.clone())
+                    .or_else(|| {
+                        if self.wallpaper_app == Some(id) {
+                            self.wallpaper_title.clone()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| format!("App {id}"));
+                let msg = format!("app lost: {title} (id {id})");
+                self.shell.push_notification(NotificationLevel::Error, msg.clone());
+                self.shell.set_last_error(msg);
+            }
             self.drop_app(id);
         }
         failed
@@ -481,6 +510,30 @@ impl App {
             }
         }
         for id in drop_ids {
+            let expected_disconnect = self.shutdown_started
+                || self
+                    .windows
+                    .iter()
+                    .find(|w| w.id == id)
+                    .is_some_and(|w| w.closing);
+            if !expected_disconnect {
+                let title = self
+                    .windows
+                    .iter()
+                    .find(|w| w.id == id)
+                    .map(|w| w.title.clone())
+                    .or_else(|| {
+                        if self.wallpaper_app == Some(id) {
+                            self.wallpaper_title.clone()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| format!("App {id}"));
+                let msg = format!("app lost: {title} (id {id})");
+                self.shell.push_notification(NotificationLevel::Error, msg.clone());
+                self.shell.set_last_error(msg);
+            }
             self.drop_app(id);
         }
     }
@@ -623,18 +676,7 @@ impl App {
         let row = STATUS_ROW;
         self.terminal.fill_row(row, COLOR_FG, COLOR_STATUS_BG);
 
-        let app_state = if !self.window_focused && self.test.is_none() {
-            "Paused (focus lost)"
-        } else if self.focused_app.is_some() {
-            "App focused (Alt+Tab switch, Ctrl+W close; Esc forwarded)"
-        } else if !self.windows.is_empty() {
-            "Shell focused (click a window to focus)"
-        } else if self.shell.in_browser() {
-            "File browser (Esc back)"
-        } else {
-            "Esc quits"
-        };
-
+        let ws_hint = "WS:1 Temple 2 Linux";
         let mut line = String::new();
         use fmt::Write as _;
         if self.test.is_some() {
@@ -643,32 +685,71 @@ impl App {
                 "Mouse: (redacted)  Output: (redacted)  Scale: (redacted)  State: (redacted)  WS: Super+1 Temple  Super+2 Linux"
             );
         } else {
+            let time = {
+                use nix::libc;
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as libc::time_t;
+                let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+                let tm_ptr = unsafe { libc::localtime_r(&secs, &mut tm) };
+                if tm_ptr.is_null() {
+                    "--:--:--".to_string()
+                } else {
+                    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+                }
+            };
+
+            let active = if !self.window_focused {
+                "Paused".to_string()
+            } else if let Some(id) = self.focused_app {
+                self.windows
+                    .iter()
+                    .find(|w| w.id == id)
+                    .map(|w| w.title.clone())
+                    .unwrap_or_else(|| format!("App {id}"))
+            } else if self.shell.in_doc_viewer() {
+                "Doc".to_string()
+            } else if self.shell.in_browser() {
+                "Files".to_string()
+            } else {
+                "Shell".to_string()
+            };
+
             let scrollback = if self.focused_app.is_none() && self.terminal.view_offset() > 0 {
                 format!("  SB:-{}", self.terminal.view_offset())
             } else {
                 String::new()
             };
 
-            match self.cursor_internal {
-                Some((x, y)) => {
-                    let _ = write!(line, "Mouse: {x:>3},{y:>3}  ");
-                }
-                None => {
-                    let _ = write!(line, "Mouse: (outside)  ");
-                }
+            let mut left = format!("{time}  Act:{active}{scrollback}");
+            if let Some(err) = self.shell.last_error.as_deref() {
+                let _ = write!(left, "  Err:{err}");
             }
-            let _ = write!(
-                line,
-                "Output: {}x{}  Scale: {:.3}x{:.3}  {}  WS: Super+1 Temple  Super+2 Linux",
-                self.output_size.width,
-                self.output_size.height,
-                self.letterbox().scale_x,
-                self.letterbox().scale_y,
-                format!("{app_state}{scrollback}")
-            );
+            line = Self::status_line_pad_right(&left, ws_hint, TERM_COLS as usize);
         }
         self.terminal
             .write_at(0, row, COLOR_FG, COLOR_STATUS_BG, &line);
+    }
+
+    fn status_line_pad_right(left: &str, right: &str, width: usize) -> String {
+        let right_len = right.chars().count();
+        if right_len >= width {
+            return right.chars().take(width).collect();
+        }
+
+        let max_left = width.saturating_sub(right_len + 1);
+        let left_trunc: String = left.chars().take(max_left).collect();
+        let left_len = left_trunc.chars().count();
+        let spaces = width.saturating_sub(left_len + right_len);
+
+        let mut line = String::with_capacity(width);
+        line.push_str(&left_trunc);
+        for _ in 0..spaces {
+            line.push(' ');
+        }
+        line.push_str(right);
+        line
     }
 
     fn paste_text_into_running_app(&mut self, text: &str) {
@@ -676,6 +757,30 @@ impl App {
 
         let Some(id) = self.focused_app else { return };
         let Some(sess) = self.temple_apps.get(&id) else {
+            let expected_disconnect = self.shutdown_started
+                || self
+                    .windows
+                    .iter()
+                    .find(|w| w.id == id)
+                    .is_some_and(|w| w.closing);
+            if !expected_disconnect {
+                let title = self
+                    .windows
+                    .iter()
+                    .find(|w| w.id == id)
+                    .map(|w| w.title.clone())
+                    .or_else(|| {
+                        if self.wallpaper_app == Some(id) {
+                            self.wallpaper_title.clone()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| format!("App {id}"));
+                let msg = format!("app lost: {title} (id {id})");
+                self.shell.push_notification(NotificationLevel::Error, msg.clone());
+                self.shell.set_last_error(msg);
+            }
             self.drop_app(id);
             return;
         };
@@ -701,6 +806,30 @@ impl App {
         }
 
         if failed {
+            let expected_disconnect = self.shutdown_started
+                || self
+                    .windows
+                    .iter()
+                    .find(|w| w.id == id)
+                    .is_some_and(|w| w.closing);
+            if !expected_disconnect {
+                let title = self
+                    .windows
+                    .iter()
+                    .find(|w| w.id == id)
+                    .map(|w| w.title.clone())
+                    .or_else(|| {
+                        if self.wallpaper_app == Some(id) {
+                            self.wallpaper_title.clone()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| format!("App {id}"));
+                let msg = format!("app lost: {title} (id {id})");
+                self.shell.push_notification(NotificationLevel::Error, msg.clone());
+                self.shell.set_last_error(msg);
+            }
             self.drop_app(id);
         }
     }
@@ -1713,7 +1842,7 @@ fn main() {
             let _ = proxy.send_event(UserEvent::Ipc(TempleIpcEvent::Log(line)));
         }
     });
-    spawn_temple_ipc_server(proxy, temple_sock.clone(), audio);
+    spawn_temple_ipc_server(proxy, temple_sock.clone(), audio.clone());
 
     let window = Arc::new({
         let mut builder = WindowBuilder::new()
@@ -1739,13 +1868,20 @@ fn main() {
         window.inner_size(),
         Some(temple_sock),
         test,
+        audio,
     );
 
     window.request_redraw();
 
+    let mut next_status_tick = std::time::Instant::now() + std::time::Duration::from_secs(1);
+
     event_loop
         .run(move |event, elwt| {
-            elwt.set_control_flow(ControlFlow::Wait);
+            if app.test.is_some() || !app.window_focused {
+                elwt.set_control_flow(ControlFlow::Wait);
+            } else {
+                elwt.set_control_flow(ControlFlow::WaitUntil(next_status_tick));
+            }
 
             match event {
                 Event::UserEvent(UserEvent::Ipc(ev)) => match ev {
@@ -1773,6 +1909,13 @@ fn main() {
                     }
                     TempleIpcEvent::Log(line) => {
                         use fmt::Write as _;
+                        let is_ipc_err = line.starts_with("ipc:") || line.starts_with("ipc[");
+                        if is_ipc_err {
+                            app.shell
+                                .push_notification(NotificationLevel::Error, line.clone());
+                            app.shell.set_last_error(line.clone());
+                            app.update_status_line();
+                        }
                         let _ = writeln!(&mut app.terminal, "{line}");
                         window.request_redraw();
                     }
@@ -1787,7 +1930,11 @@ fn main() {
                                 );
                             }
                             Err(err) => {
-                                let _ = writeln!(&mut app.terminal, "clipboard: set: {err}");
+                                let msg = format!("clipboard: set: {err}");
+                                let _ = writeln!(&mut app.terminal, "{msg}");
+                                app.shell.set_last_error(msg.clone());
+                                app.shell.push_notification(NotificationLevel::Error, msg);
+                                app.update_status_line();
                             }
                         }
                         window.request_redraw();
@@ -1829,8 +1976,11 @@ fn main() {
                             }
                             Err(err) => {
                                 use fmt::Write as _;
-                                let _ =
-                                    writeln!(&mut app.terminal, "ipc: failed to map shm: {err}");
+                                let msg = format!("ipc: failed to map shm: {err}");
+                                let _ = writeln!(&mut app.terminal, "{msg}");
+                                app.shell.set_last_error(msg.clone());
+                                app.shell.push_notification(NotificationLevel::Error, msg);
+                                app.update_status_line();
                             }
                         }
                     }
@@ -1851,6 +2001,31 @@ fn main() {
                         if app.temple_apps.contains_key(&id)
                             || app.windows.iter().any(|w| w.id == id)
                         {
+                            let expected_disconnect = app.shutdown_started
+                                || app
+                                    .windows
+                                    .iter()
+                                    .find(|w| w.id == id)
+                                    .is_some_and(|w| w.closing);
+                            if !expected_disconnect {
+                                let title = app
+                                    .windows
+                                    .iter()
+                                    .find(|w| w.id == id)
+                                    .map(|w| w.title.clone())
+                                    .or_else(|| {
+                                        if app.wallpaper_app == Some(id) {
+                                            app.wallpaper_title.clone()
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or_else(|| format!("App {id}"));
+                                let msg = format!("app disconnected: {title} (id {id})");
+                                app.shell
+                                    .push_notification(NotificationLevel::Warn, msg.clone());
+                                app.shell.set_last_error(msg);
+                            }
                             use fmt::Write as _;
                             let _ = writeln!(&mut app.terminal, "[temple app disconnected: {id}]");
                             app.drop_app(id);
@@ -1944,12 +2119,36 @@ fn main() {
                                         }
                                     }
                                     Err(err) => {
-                                        let _ =
-                                            writeln!(&mut app.terminal, "clipboard: get: {err}");
+                                        let msg = format!("clipboard: get: {err}");
+                                        let _ = writeln!(&mut app.terminal, "{msg}");
+                                        app.shell.set_last_error(msg);
                                         window.request_redraw();
                                     }
                                 }
                                 return;
+                            }
+
+                            if down {
+                                match &event.logical_key {
+                                    Key::Named(NamedKey::Escape) => {
+                                        if let Some(id) = app.focused_app {
+                                            app.close_window(id);
+                                            app.update_status_line();
+                                            window.request_redraw();
+                                            return;
+                                        }
+                                    }
+                                    Key::Named(NamedKey::F1) | Key::Named(NamedKey::F2) => {
+                                        app.focused_app = None;
+                                        if app.shell.handle_key(&event.logical_key, &mut app.terminal)
+                                        {
+                                            app.update_status_line();
+                                            window.request_redraw();
+                                        }
+                                        return;
+                                    }
+                                    _ => {}
+                                }
                             }
 
                             if let Some(id) = app.focused_app {
@@ -2020,10 +2219,9 @@ fn main() {
                                             );
                                         }
                                         Err(err) => {
-                                            let _ = writeln!(
-                                                &mut app.terminal,
-                                                "screenshot: {spec}: {err}"
-                                            );
+                                            let msg = format!("screenshot: {spec}: {err}");
+                                            let _ = writeln!(&mut app.terminal, "{msg}");
+                                            app.shell.set_last_error(msg);
                                         }
                                     }
                                     app.update_status_line();
@@ -2375,6 +2573,13 @@ fn main() {
             }
 
             if app.step_test_run_shell() {
+                window.request_redraw();
+            }
+
+            if app.test.is_none() && app.window_focused && std::time::Instant::now() >= next_status_tick
+            {
+                next_status_tick = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                app.update_status_line();
                 window.request_redraw();
             }
         })

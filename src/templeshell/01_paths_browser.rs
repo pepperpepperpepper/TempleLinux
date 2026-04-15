@@ -184,6 +184,10 @@ struct BrowserApp {
 
 const TEMPLELINUX_LINUXBRIDGE_HC: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/holyc/LinuxBridge.HC"));
+const TEMPLELINUX_CLIPBOARDBRIDGE_HC: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/holyc/ClipboardBridge.HC"));
+const TEMPLELINUX_FILEBRIDGE_HC: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/holyc/FileBridge.HC"));
 const TEMPLELINUX_TIMECLOCK_HC: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/holyc/TimeClock.HC"));
 const TEMPLELINUX_WALLPAPERCTRL_HC: &str =
@@ -216,6 +220,16 @@ const BROWSER_APPS: &[BrowserApp] = &[
         name: "LinuxBridge",
         command: "tapp linuxbridge",
         hint: "Open URLs/files/commands",
+    },
+    BrowserApp {
+        name: "ClipboardBridge",
+        command: "tapp clipboardbridge",
+        hint: "Host clipboard buffer helper",
+    },
+    BrowserApp {
+        name: "FileBridge",
+        command: "tapp filebridge",
+        hint: "Copy files to/from host",
     },
     BrowserApp {
         name: "TimeClock",

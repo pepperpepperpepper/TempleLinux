@@ -35,6 +35,10 @@ const SPT_TEXT: u8 = 27;
 const SPT_TEXT_BOX: u8 = 28;
 const SPT_TEXT_DIAMOND: u8 = 29;
 
+// Sprite blobs in DolDoc tails can be corrupted/truncated. Keep parsing/drawing robust by
+// clamping obviously-bogus coordinates so we don't overflow or take pathological slow paths.
+const SPRITE_MAX_ABS_COORD: i64 = 8_192;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SpriteBounds {
     pub x0: i32,
@@ -326,6 +330,11 @@ fn sprite_bounds_from(bytes: &[u8], start: usize) -> Option<SpriteBounds> {
                 let y = read_i32_le(bytes, off + 5)?;
                 dx = dx.saturating_add(x);
                 dy = dy.saturating_add(y);
+                if (dx as i64).abs() > SPRITE_MAX_ABS_COORD
+                    || (dy as i64).abs() > SPRITE_MAX_ABS_COORD
+                {
+                    break;
+                }
             }
             SPT_PT => {
                 let x = read_i32_le(bytes, off + 1)?;
@@ -337,6 +346,18 @@ fn sprite_bounds_from(bytes: &[u8], start: usize) -> Option<SpriteBounds> {
                 let y1 = read_i32_le(bytes, off + 5)?;
                 let x2 = read_i32_le(bytes, off + 9)?;
                 let y2 = read_i32_le(bytes, off + 13)?;
+
+                let ax1 = dx.saturating_add(x1) as i64;
+                let ay1 = dy.saturating_add(y1) as i64;
+                let ax2 = dx.saturating_add(x2) as i64;
+                let ay2 = dy.saturating_add(y2) as i64;
+                if ax1.abs() > SPRITE_MAX_ABS_COORD
+                    || ay1.abs() > SPRITE_MAX_ABS_COORD
+                    || ax2.abs() > SPRITE_MAX_ABS_COORD
+                    || ay2.abs() > SPRITE_MAX_ABS_COORD
+                {
+                    break;
+                }
 
                 let (xa, xb) = if x1 <= x2 { (x1, x2) } else { (x2, x1) };
                 let (ya, yb) = if y1 <= y2 { (y1, y2) } else { (y2, y1) };
@@ -351,6 +372,14 @@ fn sprite_bounds_from(bytes: &[u8], start: usize) -> Option<SpriteBounds> {
                 let x = read_i32_le(bytes, off + 1)?;
                 let y = read_i32_le(bytes, off + 5)?;
                 let r = read_i32_le(bytes, off + 9)?;
+                if r <= 0 || (r as i64).abs() > SPRITE_MAX_ABS_COORD {
+                    break;
+                }
+                let ax = dx.saturating_add(x) as i64;
+                let ay = dy.saturating_add(y) as i64;
+                if ax.abs() > SPRITE_MAX_ABS_COORD || ay.abs() > SPRITE_MAX_ABS_COORD {
+                    break;
+                }
                 bounds.include_rect(
                     dx.saturating_add(x).saturating_sub(r),
                     dy.saturating_add(y).saturating_sub(r),
@@ -1139,22 +1168,36 @@ fn draw_line_thick_default<T: SpriteTarget + ?Sized>(
     color: u8,
     thick: i32,
 ) {
+    const MAX_DELTA: i64 = 100_000;
+
     let thick = thick.max(1);
     let half = thick / 2;
 
+    let dx_i64 = (x2 as i64 - x1 as i64).abs();
+    let dy_i64 = (y2 as i64 - y1 as i64).abs();
+    if dx_i64 > MAX_DELTA || dy_i64 > MAX_DELTA {
+        return;
+    }
+
     let mut x = x1;
     let mut y = y1;
-    let dx = (x2 - x1).abs();
+    let dx = dx_i64;
     let sx = if x1 < x2 { 1 } else { -1 };
-    let dy = -(y2 - y1).abs();
+    let dy = -dy_i64;
     let sy = if y1 < y2 { 1 } else { -1 };
-    let mut err = dx + dy;
+    let mut err: i64 = dx + dy;
 
     loop {
         if thick == 1 {
             target.set_pixel(x, y, color);
         } else {
-            target.fill_rect(x - half, y - half, thick, thick, color);
+            target.fill_rect(
+                x.saturating_sub(half),
+                y.saturating_sub(half),
+                thick,
+                thick,
+                color,
+            );
         }
 
         if x == x2 && y == y2 {
@@ -1186,7 +1229,7 @@ fn draw_rect_outline_thick_default<T: SpriteTarget + ?Sized>(
         return;
     }
     let thick = thick.max(1);
-    if thick * 2 >= w || thick * 2 >= h {
+    if (thick as i64) * 2 >= w as i64 || (thick as i64) * 2 >= h as i64 {
         target.fill_rect(x, y, w, h, color);
         return;
     }
@@ -1205,7 +1248,12 @@ fn draw_circle_thick_default<T: SpriteTarget + ?Sized>(
     color: u8,
     thick: i32,
 ) {
+    const MAX_R: i32 = 8_192;
+
     if r <= 0 {
+        return;
+    }
+    if r > MAX_R {
         return;
     }
     let thick = thick.max(1);
@@ -1217,21 +1265,27 @@ fn draw_circle_thick_default<T: SpriteTarget + ?Sized>(
 
     while x >= y {
         let pts = [
-            (cx + x, cy + y),
-            (cx + y, cy + x),
-            (cx - y, cy + x),
-            (cx - x, cy + y),
-            (cx - x, cy - y),
-            (cx - y, cy - x),
-            (cx + y, cy - x),
-            (cx + x, cy - y),
+            (cx.saturating_add(x), cy.saturating_add(y)),
+            (cx.saturating_add(y), cy.saturating_add(x)),
+            (cx.saturating_sub(y), cy.saturating_add(x)),
+            (cx.saturating_sub(x), cy.saturating_add(y)),
+            (cx.saturating_sub(x), cy.saturating_sub(y)),
+            (cx.saturating_sub(y), cy.saturating_sub(x)),
+            (cx.saturating_add(y), cy.saturating_sub(x)),
+            (cx.saturating_add(x), cy.saturating_sub(y)),
         ];
 
         for (px, py) in pts {
             if thick == 1 {
                 target.set_pixel(px, py, color);
             } else {
-                target.fill_rect(px - half, py - half, thick, thick, color);
+                target.fill_rect(
+                    px.saturating_sub(half),
+                    py.saturating_sub(half),
+                    thick,
+                    thick,
+                    color,
+                );
             }
         }
 

@@ -241,22 +241,36 @@ impl TempleRt {
     }
 
     pub fn draw_line_thick(&mut self, x1: i32, y1: i32, x2: i32, y2: i32, color: u8, thick: i32) {
+        const MAX_DELTA: i64 = 100_000;
+
         let thick = thick.max(1);
+
+        let dx_i64 = (x2 as i64 - x1 as i64).abs();
+        let dy_i64 = (y2 as i64 - y1 as i64).abs();
+        if dx_i64 > MAX_DELTA || dy_i64 > MAX_DELTA {
+            return;
+        }
 
         let mut x = x1;
         let mut y = y1;
-        let dx = (x2 - x1).abs();
+        let dx = dx_i64;
         let sx = if x1 < x2 { 1 } else { -1 };
-        let dy = -(y2 - y1).abs();
+        let dy = -dy_i64;
         let sy = if y1 < y2 { 1 } else { -1 };
-        let mut err = dx + dy;
+        let mut err: i64 = dx + dy;
 
         loop {
             if thick == 1 {
                 self.set_pixel(x, y, color);
             } else {
                 let half = thick / 2;
-                self.fill_rect(x - half, y - half, thick, thick, color);
+                self.fill_rect(
+                    x.saturating_sub(half),
+                    y.saturating_sub(half),
+                    thick,
+                    thick,
+                    color,
+                );
             }
 
             if x == x2 && y == y2 {
@@ -292,15 +306,27 @@ impl TempleRt {
             return;
         }
         let thick = thick.max(1);
-        if thick * 2 >= w || thick * 2 >= h {
+        if (thick as i64) * 2 >= w as i64 || (thick as i64) * 2 >= h as i64 {
             self.fill_rect(x, y, w, h, color);
             return;
         }
 
         self.fill_rect(x, y, w, thick, color);
-        self.fill_rect(x, y + h - thick, w, thick, color);
-        self.fill_rect(x, y + thick, thick, h - 2 * thick, color);
-        self.fill_rect(x + w - thick, y + thick, thick, h - 2 * thick, color);
+        self.fill_rect(
+            x,
+            y.saturating_add(h).saturating_sub(thick),
+            w,
+            thick,
+            color,
+        );
+        self.fill_rect(x, y.saturating_add(thick), thick, h - 2 * thick, color);
+        self.fill_rect(
+            x.saturating_add(w).saturating_sub(thick),
+            y.saturating_add(thick),
+            thick,
+            h - 2 * thick,
+            color,
+        );
     }
 
     pub fn draw_circle(&mut self, cx: i32, cy: i32, r: i32, color: u8) {
@@ -308,7 +334,12 @@ impl TempleRt {
     }
 
     pub fn draw_circle_thick(&mut self, cx: i32, cy: i32, r: i32, color: u8, thick: i32) {
+        const MAX_R: i32 = 8_192;
+
         if r <= 0 {
+            return;
+        }
+        if r > MAX_R {
             return;
         }
         let thick = thick.max(1);
@@ -320,21 +351,27 @@ impl TempleRt {
 
         while x >= y {
             let pts = [
-                (cx + x, cy + y),
-                (cx + y, cy + x),
-                (cx - y, cy + x),
-                (cx - x, cy + y),
-                (cx - x, cy - y),
-                (cx - y, cy - x),
-                (cx + y, cy - x),
-                (cx + x, cy - y),
+                (cx.saturating_add(x), cy.saturating_add(y)),
+                (cx.saturating_add(y), cy.saturating_add(x)),
+                (cx.saturating_sub(y), cy.saturating_add(x)),
+                (cx.saturating_sub(x), cy.saturating_add(y)),
+                (cx.saturating_sub(x), cy.saturating_sub(y)),
+                (cx.saturating_sub(y), cy.saturating_sub(x)),
+                (cx.saturating_add(y), cy.saturating_sub(x)),
+                (cx.saturating_add(x), cy.saturating_sub(y)),
             ];
 
             for (px, py) in pts {
                 if thick == 1 {
                     self.set_pixel(px, py, color);
                 } else {
-                    self.fill_rect(px - half, py - half, thick, thick, color);
+                    self.fill_rect(
+                        px.saturating_sub(half),
+                        py.saturating_sub(half),
+                        thick,
+                        thick,
+                        color,
+                    );
                 }
             }
 

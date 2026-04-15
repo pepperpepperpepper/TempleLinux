@@ -974,10 +974,35 @@ Progress notes (2026-02-15):
 - Fixed a remaining `::/PersonalMenu.DD` mesh sprite artifact where some packed coords decode to “reasonable-range” `I32`s (e.g. `0x000000ff → 255`, `0xffffff00 → -256`) and bypass the mesh-coordinate unpacking heuristics, causing tall glitch triangles that overwrite icon labels in the DolDoc viewer.
 - Added a GUI golden test for `help FF:::/PersonalMenu.DD,X-Caliber` so regressions in PersonalMenu sprite/layout rendering are caught in CI (when `TEMPLE_GUI_TESTS=1` is set).
 
+Progress notes (2026-02-18):
+- Expanded DolDoc layout/tag support to better match real-world `.DD` usage beyond `Doc/`:
+  - Added support for page/margin tags used by `::/Demo/DolDoc/DemoDoc.DD`: `HD`, `FO`, `LM`, `RM`, `PB`.
+  - Implemented an RM-constrained wrapping mode (with optional word-wrap when `WW` is enabled) without changing the default rendering for existing docs.
+  - Render `PB` as a visible page separator (best-effort header/footer spacing).
+- Implemented Psalmody `$SO` song playback in the DolDoc viewer: clicking a song link plays TempleOS `Play()`-style note strings (e.g. `::/Apps/Psalmody/Help.DD`).
+- Made `$TX,"...",HTML="http(s)://..."$` entries render as safe, clickable `browse` actions (opens via `xdg-open`), matching how many real `.DD` files store external links (e.g. `::/Adam/God/HSNotes.DD`, `::/Demo/ToHtmlToTXTDemo/DemoInPage.DD`).
+- Stopped stripping `//` code comments during DolDoc rendering; many `.DD` files use `//` as visible commentary in code blocks (e.g. `::/Doc/HelloWorld.DD`, `::/Doc/StdTempleOSPC.DD`, `::/Compiler/OpCodes.DD`).
+- Extended shell file-text viewing builtins (`cat`/`more`/`head`/`tail`/`grep`/`wc`) to decode CP437 when input is not UTF-8 (avoids `from_utf8_lossy` replacement chars; stops at NUL like the doc viewer).
+
+Progress notes (2026-02-19):
+- Fixed DolDoc `$$$...$$$` escaping so common “literal `$`” sequences like `$FG,2$$$$FG$` don’t get misparsed as a giant literal block (improves docs like `::/Doc/Tips.DD`).
+- Implemented TempleOS `.Z` (`CArcCompress`) handling in HolyC file I/O: `.Z` files written via `FileWrite` are now stored as real `CArcCompress` buffers (CT_NONE/CT_7_BIT/CT_8_BIT), and `FileRead` auto-expands them (while still accepting legacy “raw bytes with a .Z suffix” files).
+- Added `.Z` transparency to TempleShell file-text viewing builtins (`cat`/`more`/`head`/`tail`/`grep`/`wc`): when the file has a real `CArcCompress` header, auto-expand before UTF-8/CP437 decoding (with conservative size caps to avoid huge allocations).
+- Improved DolDoc `$CM` cursor movement fidelity to support column/page layout flags used by real docs/demos (notably `+CX/+MRX` and `+TY/+CY/+BY/+PRY`, plus negative Y).
+- Fixed a crash when rendering sprite-heavy DolDoc demos like `::/Demo/DolDoc/DemoDoc.DD` by clamping obviously-corrupt sprite primitives (prevents overflow/pathological line/circle drawing); added a GUI golden test for `help ::/Demo/DolDoc/DemoDoc.DD` to lock in `$CM` multi-column behavior.
+
 Next:
 - Expand DolDoc layout/widget tags as needed by more real docs (tables/columns, widgets, and richer formatting):
-  - Optional: support Psalmody playback for `$SO` songs.
-- If we encounter more CP437 quirks: extend decode/encode handling (we now have a full CP437 mapping + a non-UTF8 decode fallback, but TempleOS sources sometimes have surprises).
+  - ✅ Support `HD`/`FO`/`LM`/`RM`/`PB` layout tags (`Demo/DolDoc/DemoDoc.DD`).
+  - ✅ Add GUI golden coverage for `help ::/Demo/DolDoc/DemoDoc.DD` (multi-column `$CM` + `$SP` sprite bin tail).
+  - ✅ Make `$TX,...,HTML="..."$` entries clickable `browse` links (external URLs).
+  - ✅ Render `//` code comments verbatim (don’t treat them as hidden comments).
+  - ✅ Fix `$$$...$$$` escape parsing when used alongside `$$` “literal `$`” escapes (e.g. `$FG,2$$$$FG$`).
+  - ✅ Support DolDoc `$CM` cursor-move flags used for multi-column/page layouts (`+CX/+MRX`, `+TY/+CY/+BY/+PRY`, and negative Y).
+  - ✅ Optional: support Psalmody playback for `$SO` songs.
+- ✅ Extend decode/encode handling for CP437-heavy content (full CP437 mapping + non-UTF8 decode fallback, used consistently across docs + shell text viewing).
+- Expand TempleShell file-text commands to match HolyC file I/O semantics:
+  - ✅ `.Z` auto-expansion (TempleOS `CArcCompress`) for `cat`/`more`/`head`/`tail`/`grep`/`wc`.
 
 ### Milestone 35: Adam-like editor story (TempleOS dev loop)
 Status (2026-02-04): Completed (TempleLinux has an Adam-like dev loop: edit → run → jump-to-error, while treating the vendored TempleOS tree as read-only).
@@ -1170,8 +1195,7 @@ Next:
       - ✅ queues: `QueInit`, `QueIns`, `QueRem` (circular doubly-linked list).
       - ✅ file I/O: `FileRead`, `FileWrite`, `FileFind`, `DirMk` (Temple root mapping + `~/` handling).
       - ✅ time/date: `Now`, `CDate` `.date`/`.time`, plus `%D/%T` formatting support.
-      - ⏭ Remaining fidelity blockers for a *fully TempleOS-faithful* TimeClock experience:
-        - optional: `.Z` compression semantics (TempleOS uses a custom archive format for “compressed” files; TempleLinux currently treats `.Z` as a plain file, which is sufficient for most vendored sources but not 1:1 faithful).
+      - ✅ `.Z` compression semantics (TempleOS `CArcCompress`; `.Z` files auto-compress/decompress on `FileRead`/`FileWrite` while keeping compatibility with older raw `.Z` files).
   - ✅ one upstream **controls/UI** demo from `::/Demo/Graphics/` (unmodified), to better represent the “full TempleOS UI” beyond the shell:
     - `::/Demo/Graphics/Slider.HC`
 
@@ -1188,15 +1212,15 @@ Next:
 ### Milestone 38: Headless GUI regression testing (Xvfb + Wayland headless)
 Status (2026-02-02): Completed (use local virtual framebuffer support for X11/Wayland to run TempleShell in automated tests and catch visual regressions).
 Acceptance:
-- A single command runs TempleShell headlessly and exits deterministically (no manual window management).
-- TempleShell can dump its internal framebuffer to a PNG for tests (or we can use compositor screenshot tooling, but internal dump is preferred).
-- Provide scripts for both backends:
+- ✅ A single command runs TempleShell headlessly and exits deterministically (no manual window management).
+- ✅ TempleShell can dump its internal framebuffer to a PNG for tests (or we can use compositor screenshot tooling, but internal dump is preferred).
+- ✅ Provide scripts for both backends:
   - X11: `xvfb-run` (Xvfb virtual framebuffer; if you have a local wrapper like `fvxb`, use that too)
   - Wayland: `weston --backend=headless-backend.so` (Wayland headless compositor; or `fvxb` if it provides a Wayland VFB wrapper)
-- Add a small set of golden-image tests (or a pixel-diff tolerance-based comparator) for:
+- ✅ Add a small set of golden-image tests (or a pixel-diff tolerance-based comparator) for:
   - terminal text rendering (font/palette correctness)
   - at least one upstream HolyC demo output frame
-- Document required env vars for headless wgpu if needed (e.g. software Vulkan / backend selection).
+- ✅ Document required env vars for headless wgpu if needed (e.g. software Vulkan / backend selection).
 
 Progress notes (2026-02-02):
 - Added a TempleShell test mode to dump the internal framebuffer to PNG:
@@ -1218,7 +1242,11 @@ Progress notes (2026-02-02):
   - `tests/gui_smoke.rs` captures the initial TempleShell frame and the first `NetOfDots.HC` frame, then checks a pinned SHA-256 for each.
   - Test-mode status line redacts mouse/output/scale text to keep the images stable across headless environments.
 - Headless notes:
-  - If Xvfb crashes due to NVIDIA EGL selection, force Mesa (example): `__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json LIBGL_ALWAYS_SOFTWARE=1 WGPU_BACKEND=gl …`
+  - The headless smoke scripts default to Mesa software rendering to avoid GLVND selecting NVIDIA’s EGL vendor libraries:
+    - X11/Xvfb: `__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json __GLX_VENDOR_LIBRARY_NAME=mesa LIBGL_ALWAYS_SOFTWARE=1 WGPU_BACKEND=gl WINIT_UNIX_BACKEND=x11 …`
+    - Wayland/Weston headless: `__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json LIBGL_ALWAYS_SOFTWARE=1 WGPU_BACKEND=gl …`
+  - For Vulkan-based headless runs, try `WGPU_BACKEND=vulkan` and select a software Vulkan ICD if needed (e.g. Mesa lavapipe via `VK_ICD_FILENAMES=...`).
+  - See: `packaging/bin/templelinux-gui-smoke-x11` and `packaging/bin/templelinux-gui-smoke-wayland`.
 
 Progress notes (2026-02-04):
 - Extended TempleShell test tooling to better capture “full TempleOS UI” interactions in headless runs:
@@ -1276,6 +1304,13 @@ Progress notes (2026-02-17):
   - `open`, `browse`, and `run` now attempt the Linux workspace switch *before* spawning the external process.
   - Doc-viewer `templelinux:browse:` actions switch workspaces pre-spawn as well (and best-effort switch back on spawn failure).
 
+Progress notes (2026-02-22):
+- Checked off Milestone 38 acceptance: deterministic headless runs are supported (e.g. `packaging/bin/templelinux-gui-smoke-x11` / `packaging/bin/templelinux-gui-smoke-wayland`).
+- Checked off Milestone 38 acceptance: TempleShell supports dumping its internal framebuffer to PNG via `--test-dump-initial-png` and related test-dump flags.
+- Checked off Milestone 38 acceptance: headless runner scripts exist for both X11 and Wayland backends (`packaging/bin/templelinux-gui-smoke-x11`, `packaging/bin/templelinux-gui-smoke-wayland`).
+- Checked off Milestone 38 acceptance: golden-image GUI regression tests exist in `tests/gui_smoke.rs` (gated behind `TEMPLE_GUI_TESTS=1`), covering both the initial TempleShell frame and an upstream HolyC demo frame (`NetOfDots.HC`).
+- Checked off Milestone 38 acceptance: documented headless `wgpu` environment variables for reliable software rendering + backend selection (`WGPU_BACKEND`, Mesa/GLVND overrides, optional `VK_ICD_FILENAMES` for lavapipe).
+
 ### Milestone 39: Distribution packages (Arch + Ubuntu)
 Status (2026-02-17): Completed (priority; “install on top of” existing distros)
 
@@ -1284,20 +1319,20 @@ Goal:
 
 Acceptance:
 - Arch Linux:
-  - Provide an AUR `templelinux-git` (or similar) package that installs:
+  - ✅ Provide an AUR `templelinux-git` (or similar) package that installs:
     - `templeshell`, `temple-hc`, `temple-edit`, `temple-paint`, `temple-demo` to `/usr/bin/`.
     - `templelinux-session` to `/usr/bin/` (or `/usr/lib/templelinux/` + a small `/usr/bin/` wrapper).
     - `packaging/wayland-sessions/templelinux.desktop` to `/usr/share/wayland-sessions/`.
     - The TempleOS source/assets tree to `/usr/share/templelinux/TempleOS/` so `TEMPLEOS_ROOT` auto-discovery works out of the box.
-  - Document required deps + optional deps (sway session, XWayland, test tooling).
+  - ✅ Document required deps + optional deps (sway session, XWayland, test tooling).
 - Ubuntu/Debian:
-  - Provide a `.deb` (either via `cargo-deb` or `debian/` packaging) that installs the same filesystem layout.
-  - Ensure runtime deps are accurate (Wayland/X11 libs, GL/EGL/Vulkan stack, ALSA, `xdg-open`, etc).
-- Post-install workflow:
-  - `templeshell` runs from an existing desktop session without needing `cargo`.
-  - The login manager shows “TempleLinux” as a Wayland session (via `/usr/share/wayland-sessions/templelinux.desktop`).
-  - `templelinux-session` starts the compositor (initially `sway`) + fullscreen `templeshell` reliably.
-  - `TEMPLEOS_ROOT` discovery works when installed system-wide (default should be `/usr/share/templelinux/TempleOS`).
+  - ✅ Provide a `.deb` (either via `cargo-deb` or `debian/` packaging) that installs the same filesystem layout.
+  - ✅ Ensure runtime deps are accurate (Wayland/X11 libs, GL/EGL/Vulkan stack, ALSA, `xdg-open`, etc).
+  - Post-install workflow:
+    - ✅ `templeshell` runs from an existing desktop session without needing `cargo`.
+    - ✅ The login manager shows “TempleLinux” as a Wayland session (via `/usr/share/wayland-sessions/templelinux.desktop`).
+    - ✅ `templelinux-session` starts the compositor (initially `sway`) + fullscreen `templeshell` reliably.
+    - `TEMPLEOS_ROOT` discovery works when installed system-wide (default should be `/usr/share/templelinux/TempleOS`).
 
 Notes / constraints:
 - If bundling TempleOS sources/assets in binary packages is undesirable or legally constrained, split packaging into:
@@ -1309,13 +1344,20 @@ Progress notes (2026-02-17):
 - Added Arch AUR packaging skeleton under `packaging/arch/templelinux-git/`:
   - `PKGBUILD` installs TempleLinux binaries, `templelinux-session`, and the Wayland session entry.
   - Installs the vendored TempleOS tree to `/usr/share/templelinux/TempleOS` for out-of-the-box `TEMPLEOS_ROOT` discovery.
+- Checked off Milestone 39 acceptance: Arch AUR packaging exists via `packaging/arch/templelinux-git/PKGBUILD` (binaries + session entry + `/usr/share/templelinux/TempleOS` layout).
+- Checked off Milestone 39 acceptance: Arch runtime deps + optional deps are documented via `depends`/`optdepends` in `packaging/arch/templelinux-git/PKGBUILD` (including `sway`, `xorg-xwayland`, and GUI smoke tooling like `xorg-server-xvfb` / `weston`).
 - Added Debian/Ubuntu packaging scripts under `packaging/debian/`:
   - `build-debs.sh` builds two packages: `templelinux` and `templelinux-templeos-data`.
   - Includes `.gitignore` so local build artifacts don’t pollute the repo.
+- Checked off Milestone 39 acceptance: Debian/Ubuntu `.deb` packages exist via `packaging/debian/build-debs.sh`, installing the same `/usr/bin/`, `/usr/share/wayland-sessions/`, and `/usr/share/templelinux/TempleOS` layout.
 - Expanded `README.md` install instructions (from-source, Arch, Debian/Ubuntu, sway session, uninstall).
 - Tweaked the Arch `PKGBUILD` to disable debug subpackages (`options=('!debug')`) since the TempleOS tree includes non-debug binaries and makes `makepkg` emit noisy `gdb-add-index` errors.
 - Fixed `packaging/debian/build-debs.sh` version parsing and validated `.deb` builds in an Ubuntu 24.04 Docker container (artifacts in `packaging/debian/dist/`).
 - Tweaked Debian runtime deps to prefer real ALSA (`libasound2t64 | libasound2`) so `apt install` won’t accidentally satisfy `libasound2` via OSS shim packages that break audio symbol resolution.
+- Checked off Milestone 39 acceptance: audited Debian runtime deps against `templeshell`'s dlopen targets and updated `packaging/debian/build-debs.sh` to include missing X11/EGL libraries.
+- Checked off Milestone 39 acceptance: validated `templeshell` runs as a standalone binary (no `cargo`) by dumping an initial frame under Xvfb from a non-repo working directory.
+- Checked off Milestone 39 acceptance: validated `packaging/wayland-sessions/templelinux.desktop` as a Wayland session entry (passes `desktop-file-validate`) and ensured packaging installs it to `/usr/share/wayland-sessions/`.
+- Checked off Milestone 39 acceptance: hardened `packaging/bin/templelinux-session` sway startup (stable `1:Temple`/`2:Linux` workspaces, unique runtime config via `mktemp`, conditional `xwayland enable`, optional `dbus-run-session`) and verified it passes `shellcheck`.
 
 ---
 
@@ -1705,14 +1747,22 @@ Treat `third_party/TempleOS` as the canonical tree to browse/run/learn from (Mil
 
 ### 20.2 TempleLinux-specific HolyC apps
 
-- **LinuxBridge**: launch URLs/files/commands on the Linux workspace (Milestone 36).
-- Optional: **ClipboardBridge**: copy/paste plain text via the host clipboard.
-- Optional: **FileBridge**: quick “copy to/from” host directories.
+- ✅ **LinuxBridge**: launch URLs/files/commands on the Linux workspace (Milestone 36).
+- ✅ Optional: **ClipboardBridge**: copy/paste plain text via the host clipboard.
+- ✅ Optional: **FileBridge**: quick “copy to/from” host directories.
 
 ### 20.3 Host-side helpers
 
-- TempleShell UI + app launcher.
-- A small bridge helper that executes `xdg-open` / a command allowlist safely (optional).
+- ✅ TempleShell UI + app launcher.
+- ✅ A small bridge helper that executes `xdg-open` / a command allowlist safely (optional).
+
+Progress notes (2026-02-20):
+- Checked off **LinuxBridge** in the “TempleLinux-specific HolyC apps” checklist (Milestone 36).
+- Checked off the host-side “UI + app launcher” helper: TempleShell includes a fullscreen file browser/launcher (`files` / `fm`) with an **Apps** tab for launching common Temple apps without typing (and `tapp` remains available for power users).
+- Added `temple-bridge-helper`: a small host-side exec helper for `xdg-open` (`browse`/`open`) and an allowlisted `run` command (deny-by-default via `TEMPLE_LINUX_RUN_ALLOW` or `Cfg/LinuxRunAllow.txt`); `temple-hc`’s `LinuxBrowse/Open/Run` now prefer the helper (with direct-spawn fallback if missing).
+- Added `ClipboardBridge` (launch via `tapp clipboardbridge`): a tiny HolyC app that maintains an editable clipboard buffer (multi-line `GetStr`) and can copy it to the host clipboard (`ClipPutS`), relying on TempleShell’s paste hotkey (Ctrl+V / Shift+Ins) for host→Temple input.
+- Added `FileBridge` (launch via `tapp filebridge`): a tiny HolyC app for copying files/dirs between Temple paths and Linux host paths, backed by new `temple-hc` built-ins `LinuxCopyToHost` / `LinuxCopyFromHost` (with a configurable host-path allowlist via `TEMPLE_LINUX_FILE_ALLOW` or `/Cfg/LinuxFileAllow.txt`).
+- Checked off the `src/main.rs` split-into-modules refactor item (already implemented): `src/main.rs` is now a small `include!(...)` stub that composes `src/templeshell/*` modules.
 
 ---
 
@@ -1720,15 +1770,20 @@ Treat `third_party/TempleOS` as the canonical tree to browse/run/learn from (Mil
 
 Quality-of-life items that dramatically improve “OS feel”:
 
-- Tab completion for commands and paths (Temple root scoped).
-- Rich `help` output: list commands, show usage, link to docs.
-- Consistent keybindings (Esc to exit apps, F1 help, etc.).
-- A visible status line: time, active app/window, workspace hint, last error.
-- A small “notifications” log inside TempleShell for app crashes and IPC errors.
+- ✅ Tab completion for commands and paths (Temple root scoped).
+- ✅ Rich `help` output: list commands, show usage, link to docs.
+- ✅ Consistent keybindings (Esc to exit apps, F1 help, etc.).
+- ✅ A visible status line: time, active app/window, workspace hint, last error.
+- ✅ A small “notifications” log inside TempleShell for app crashes and IPC errors.
 
 Progress notes (2026-02-17):
 - Implemented prompt Tab completion for built-in commands and paths (Temple root), with `::/` completion for the vendored TempleOS tree when `TEMPLEOS_ROOT` is discoverable.
 - Expanded `help` output: categorized command list with usage, docs pointers, and a built-in `help keymap` page (also used when TempleOS DolDoc macros request `KeyMap`).
+
+Progress notes (2026-02-19):
+- Made hotkeys consistent across shell/browser/doc/app focus: `F1` opens key bindings, `F2` opens the launcher (even when an app window is focused), and `Esc` closes the focused app window.
+- Updated the status line to show a clock, current focus context (app/title, shell, doc, files), workspace hint, and the last error; it refreshes once per second and tracks errors from shell commands + host clipboard/IPC/screenshot failures.
+- Added a small in-shell notifications log (`notifs` / `notify`) that records IPC errors and unexpected Temple app disconnects (crash-ish exits), with `notifs clear` to reset it.
 
 ---
 
@@ -1751,14 +1806,14 @@ Targets:
 - Keep `third_party/TempleOS/` as an upstream mirror (read-only) and **do not fork** unless unavoidable.
 
 Planned refactors (no behavior changes):
-- Split `src/bin/temple_hc.rs` into modules:
+- ✅ Split `src/bin/temple_hc.rs` into modules:
   - `lexer` / `parser` / `ast`
   - `preprocess` (includes + defines)
   - `vm` (execution + heap + objects)
   - `builtins` (TempleOS API shims)
   - `fmt` (TempleOS-style formatting)
   - move the large `#[cfg(test)]` harness into a `tests` module file
-- Split `src/main.rs` into modules:
+- ✅ Split `src/main.rs` into modules:
   - terminal + command parsing
   - file browser
   - DolDoc viewer
@@ -1766,9 +1821,14 @@ Planned refactors (no behavior changes):
   - rendering + screenshot/test mode plumbing
 
 Acceptance:
-- `cargo test` passes unchanged.
-- Golden-image tests (`TEMPLE_GUI_TESTS=1`) still pass.
-- No user-facing behavior changes; only structure.
+- ✅ `cargo test` passes unchanged.
+- ✅ Golden-image tests (`TEMPLE_GUI_TESTS=1`) still pass.
+- ✅ No user-facing behavior changes; only structure.
+
+Progress notes (2026-02-21):
+- Verified `cargo test -q` passes (and checked off the acceptance item).
+- Verified `TEMPLE_GUI_TESTS=1 cargo test -q --test gui_smoke` passes (10 tests).
+- With tests + GUI goldens passing, no user-facing behavior changes observed from the refactor.
 
 Progress notes (2026-02-05):
 - Split the `temple-hc` monolith into smaller files under `src/bin/temple_hc/` and replaced `src/bin/temple_hc.rs` with `include!(...)` stubs (same semantics, easier to navigate).

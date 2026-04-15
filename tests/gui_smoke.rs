@@ -13,7 +13,9 @@ const GOLDEN_X11_INITIAL_SHA256: &str =
 const GOLDEN_X11_FILEBROWSER_SHA256: &str =
     "d51e253609b0ec37d5b662a715a40d76bcb6ca2809575f4cd776375b96ce5add";
 const GOLDEN_X11_DOLDOC_DEMOINDEX_SHA256: &str =
-    "c671403c450fd1c9a8f1ab6beb0bdb84ba8069362f428d36c0a045a59520aa40";
+    "dfe0dc226e5e1422747eacc4e77ca8923421afd2783c56cda2c7927c5df06d7b";
+const GOLDEN_X11_DOLDOC_DEMODOC_SHA256: &str =
+    "90e8d2cd4d814495d0408d3a1a417b243674bad2351fb896772e092a6092b867";
 const GOLDEN_X11_DOLDOC_PERSONALMENU_XCALIBER_SHA256: &str =
     "6d5ca3072b6e6211dbd15db2fa08bb5c083b41b2ad4b442a58382cf8752c3b21";
 const GOLDEN_X11_NETOFDOTS_SHA256: &str =
@@ -274,6 +276,42 @@ fn gui_smoke_x11_doldoc_demoindex_matches_golden_sha() {
     };
     assert!(status.success(), "templeshell failed: {status}");
     assert_png_640x480_matches_sha256(&png_path, GOLDEN_X11_DOLDOC_DEMOINDEX_SHA256);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn gui_smoke_x11_doldoc_demodoc_matches_golden_sha() {
+    if !should_run_gui_tests() {
+        eprintln!("skipping GUI golden test (set TEMPLE_GUI_TESTS=1 to enable)");
+        return;
+    }
+    let _lock = gui_test_lock();
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let templeshell = cargo_bin_path("templeshell");
+    ensure_cargo_bin(&manifest_dir, "templeshell", &templeshell);
+    let temp = unique_temp_dir("templelinux-gui-golden-doldoc-demodoc");
+    let temple_root = temp.join("root");
+    fs::create_dir_all(&temple_root).expect("create TEMPLE_ROOT");
+    let png_path = temp.join("doldoc-demodoc.png");
+
+    let mut shell = xvfb_run_templeshell(&manifest_dir, &templeshell, &temple_root);
+    shell
+        .arg("--test-run-shell")
+        .arg("help ::/Demo/DolDoc/DemoDoc.DD")
+        .arg("--test-dump-initial-png")
+        .arg(&png_path);
+
+    let status = match shell.status() {
+        Ok(status) => status,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping GUI golden test (xvfb-run not found)");
+            return;
+        }
+        Err(err) => panic!("spawn xvfb-run: {err}"),
+    };
+    assert!(status.success(), "templeshell failed: {status}");
+    assert_png_640x480_matches_sha256(&png_path, GOLDEN_X11_DOLDOC_DEMODOC_SHA256);
 }
 
 #[test]
